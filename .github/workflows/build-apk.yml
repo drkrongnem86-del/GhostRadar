@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    # Samsung A17 = ARM64. ubuntu-latest có sẵn Android SDK
+    # Samsung A17 = ARM64. ubuntu-latest có sẵn JDK 17
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -26,10 +26,18 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Flutter (stable)
+      # camera 0.12 / record_android 1.5 cần Android SDK platform 36
+      - name: Set up Android SDK (platform 36, build-tools 36)
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 36
+          build-tools-version: 36.0.0
+
+      # Flutter >= 3.27 (Dart >= 3.6) cần cho camera 0.12
+      - name: Set up Flutter (3.32.8 stable)
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.24.5"
+          flutter-version: "3.32.8"
           channel: stable
           cache: true
 
@@ -44,7 +52,7 @@ jobs:
       - name: Analyze (best-effort)
         run: flutter analyze || true
 
-      - name: Build APK (Samsung A17 — arm64, minSdk 23, targetSdk 34)
+      - name: Build APK (Samsung A17 — arm64, minSdk 24, targetSdk 34)
         run: |
           flutter build apk \
             --release \

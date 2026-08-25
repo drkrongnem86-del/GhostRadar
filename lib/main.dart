@@ -1,6 +1,6 @@
-// Ghost Radar - Phân tích tín hiệu âm thanh hạ tần 0-20 Hz + camera âm bản
+// Ghost Radar v1.4.0 - "Tesla-style" multi-modal ghost detection
 //
-// Audio pipeline:
+// Audio pipeline (low-freq 0-20Hz):
 //   PCM 44.1kHz → 4-stage IIR anti-alias (25Hz)
 //                → decimate 441× → 100Hz
 //                → 256-point Hann-windowed FFT
@@ -12,12 +12,19 @@
 //   Mỗi alarm → tạo _Blip tại heading hiện tại
 //   Blip fading 8s, blip sáng nhất = "mục tiêu"
 //
-// Camera:
-//   Live preview + ColorFilter.matrix âm bản (invert RGB) + scanlines retro
-//   Sync border/glow với alarm
+// Camera + ML Kit Object Detection (Tesla-style):
+//   - Live camera preview với âm bản filter (invert RGB) + scanlines
+//   - startImageStream → CameraImage → InputImage (NV21/YUV_420_888)
+//   - ML Kit ObjectDetector chạy on-device, mỗi 5 frame
+//   - Bounding box overlay vẽ lên preview (màu theo class label)
+//   - Detection list: top object + số object + confidence
+//   - "Ghost Combo" alert khi audio alarm + visual detection cùng lúc
 //
-// Lưu ý: 1 mic + 1 RGB cam + la bàn KHÔNG cho DOA/IR thật.
-// Samsung A17 không có camera IR; "âm bản" chỉ là hiệu ứng giả lập.
+// Lưu ý khoa học:
+//   - Phone mic cắt <20Hz bằng phần cứng
+//   - Phone RGB camera không phải IR thật, "âm bản" là giả lập
+//   - ML Kit chỉ detect 5 category (Fashion, Home, Place, Plant, Food)
+//     - vẫn đủ impressive cho demo "ghost hunting"
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -27,6 +34,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:sensors_plus/sensors_plus.dart';
@@ -65,8 +73,8 @@ class _Blip {
     required this.bandIndex,
     required this.detectedAt,
   });
-  final double angleDeg; // 0..360, 0=Bắc, 90=Đông
-  final double energy; // 0..1
+  final double angleDeg;
+  final double energy;
   final int bandIndex;
   final DateTime detectedAt;
 
@@ -74,6 +82,23 @@ class _Blip {
       DateTime.now().difference(detectedAt).inMilliseconds / 1000.0;
   double get fade => (1.0 - (ageSeconds / 8.0)).clamp(0.0, 1.0);
   double get score => energy * fade;
+}
+
+class _DetectedObj {
+  _DetectedObj({
+    required this.label,
+    required this.confidence,
+    required this.boundingBox, // Rect in image pixel coordinates (after rotation)
+    required this.detectedAt,
+  });
+  final String label;
+  final double confidence;
+  final Rect boundingBox;
+  final DateTime detectedAt;
+
+  double get ageSeconds =>
+      DateTime.now().difference(detectedAt).inMilliseconds / 1000.0;
+  double get fade => (1.0 - (ageSeconds / 3.0)).clamp(0.0, 1.0);
 }
 
 class RadarScreen extends StatefulWidget {
@@ -91,7 +116,7 @@ class _RadarScreenState extends State<RadarScreen>
   int _decCount = 0;
   static const int _decFactor = 441;
 
-  // ====== Low-rate circular buffer (256 @ 100Hz = 2.56s) ======
+  // ====== Low-rate circular buffer ======
   static const int _fftSize = 256;
   static const double _binHz = 100 / _fftSize;
   final Float64List _lrBuffer = Float64List(_fftSize);
@@ -126,20 +151,31 @@ class _RadarScreenState extends State<RadarScreen>
   static const double _emaAlpha = 0.92;
   int _baselineWarmupLeft = 30;
 
-  // ====== Compass (manual tilt-compensated heading) ======
+  // ====== Compass (manual heading) ======
   double _heading = 0;
   bool _hasCompass = false;
-  // Smoothed gravity từ accelerometer
   double _gx = 0, _gy = 0, _gz = 0;
-  // Magnetometer thô
   double _mx = 0, _my = 0, _mz = 0;
   StreamSubscription<AccelerometerEvent>? _accelSub;
   StreamSubscription<MagnetometerEvent>? _magSub;
 
-  // ====== Camera ======
+  // ====== Camera + ML Kit ======
   CameraController? _cameraController;
   List<CameraDescription> _cameras = <CameraDescription>[];
   String _cameraError = '';
+  ObjectDetector? _objectDetector;
+  bool _isDetecting = false;
+  int _frameCounter = 0;
+  static const int _detectEveryNFrames = 5; // xử lý mỗi 5 frame
+
+  // Detected objects (giữ ~3 giây history)
+  final List<_DetectedObj> _detections = <_DetectedObj>[];
+  static const double _detectionLifetimeSec = 3.0;
+  // Map: label → count (đếm nhanh)
+  final Map<String, int> _objectCounts = <String, int>{};
+  // Top detection
+  String _topLabel = '--';
+  double _topConfidence = 0;
 
   // ====== Blips ======
   final List<_Blip> _blips = <_Blip>[];
@@ -152,18 +188,20 @@ class _RadarScreenState extends State<RadarScreen>
   int _alarmCount = 0;
   String _lastAlarmSummary = '';
   bool _alarmMuted = false;
-  Timer? _alarmHapticTimer; // lặp haptic mỗi 350ms trong khi alarm
+  Timer? _alarmHapticTimer;
+  bool _ghostCombo = false; // audio + visual cùng alarm
 
   // ====== UI state ======
   bool _isScanning = false;
   String _statusText = 'CHƯA KHỞI ĐỘNG';
   String _noteText =
-      'Bấm BẮT ĐẦU QUÉT. Cầm điện thoại thẳng đứng, xoay người chậm 360° để dò hướng có năng lượng mạnh nhất. Camera bên cạnh hiển thị ảnh âm bản để soi vùng "nghi ngờ".';
+      'Bấm BẮT ĐẦU QUÉT. Mic dò 0-20Hz, camera dò đối tượng real-time. Khi cả hai cùng trigger → GHOST COMBO 🔴';
   double _level = 0.0;
   double _angle = 0.0;
   double _sensitivity = 2.5;
   String _dominantBandName = '--';
   double _dominantBandHz = 0;
+  int _comboCount = 0;
 
   // ====== Audio plumbing ======
   AudioRecorder? _recorder;
@@ -171,7 +209,6 @@ class _RadarScreenState extends State<RadarScreen>
   Timer? _analysisTimer;
   late final Ticker _ticker;
 
-  // ====== Compass direction labels (Vietnamese) ======
   static const List<String> _compassDirs = <String>[
     'B', 'BĐ', 'Đ', 'ĐN', 'N', 'NT', 'T', 'TB',
   ];
@@ -192,6 +229,7 @@ class _RadarScreenState extends State<RadarScreen>
 
     _startSensors();
     _initCamera();
+    _initObjectDetector();
   }
 
   void _onTick(Duration elapsed) {
@@ -200,6 +238,15 @@ class _RadarScreenState extends State<RadarScreen>
       if (_isScanning) {
         _angle = (_angle + 2.5) % 360.0;
       }
+      // Dọn detection cũ mỗi tick
+      _detections.removeWhere((d) => d.ageSeconds > _detectionLifetimeSec);
+      if (_detections.isEmpty) {
+        _objectCounts.clear();
+        _topLabel = '--';
+        _topConfidence = 0;
+      }
+      // Kiểm tra ghost combo
+      _checkGhostCombo();
     });
   }
 
@@ -212,6 +259,7 @@ class _RadarScreenState extends State<RadarScreen>
     _streamSub?.cancel();
     _accelSub?.cancel();
     _magSub?.cancel();
+    _objectDetector?.close();
     _recorder?.dispose();
     _cameraController?.dispose();
     super.dispose();
@@ -228,20 +276,18 @@ class _RadarScreenState extends State<RadarScreen>
     }
   }
 
-  // ====== Sensors (heading manual) ======
+  // ====== Sensors ======
   void _startSensors() {
     try {
       _accelSub = accelerometerEventStream(
         samplingPeriod: const Duration(milliseconds: 100),
       ).listen((AccelerometerEvent e) {
-        // Low-pass lấy gravity (α nhỏ để mượt)
         const double a = 0.15;
         _gx = a * e.x + (1 - a) * _gx;
         _gy = a * e.y + (1 - a) * _gy;
         _gz = a * e.z + (1 - a) * _gz;
       }, onError: (Object _) {});
     } catch (_) {}
-
     try {
       _magSub = magnetometerEventStream(
         samplingPeriod: const Duration(milliseconds: 100),
@@ -267,14 +313,11 @@ class _RadarScreenState extends State<RadarScreen>
     final double nmy = _my / mNorm;
     final double nmz = _mz / mNorm;
 
-    // East = magnetic × gravity
     final double ex = nmy * ngz - nmz * ngy;
     final double ey = nmz * ngx - nmx * ngz;
     final double ez = nmx * ngy - nmy * ngx;
 
-    // North = gravity × east
     final double ny = ngz * ex - ngx * ez;
-    // (nx không dùng trực tiếp, chỉ cần ny cho atan2)
 
     double headingRad = math.atan2(ey, ny);
     double headingDeg = headingRad * 180 / math.pi;
@@ -301,20 +344,25 @@ class _RadarScreenState extends State<RadarScreen>
         if (mounted) setState(() => _cameraError = 'Không tìm thấy camera');
         return;
       }
-      // Ưu tiên back camera
       CameraDescription cam = _cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.back,
         orElse: () => _cameras.first,
       );
       final controller = CameraController(
         cam,
-        ResolutionPreset.low, // 240p, tiết kiệm CPU
+        ResolutionPreset.low,
         enableAudio: false,
       );
       await controller.initialize();
       if (!mounted) {
         await controller.dispose();
         return;
+      }
+      // Bắt đầu image stream cho ML Kit
+      try {
+        await controller.startImageStream(_processCameraImage);
+      } catch (e) {
+        // Một số thiết bị không cho start stream cùng lúc với preview
       }
       setState(() {
         _cameraController = controller;
@@ -323,6 +371,148 @@ class _RadarScreenState extends State<RadarScreen>
     } catch (e) {
       if (mounted) setState(() => _cameraError = 'Lỗi camera: $e');
     }
+  }
+
+  // ====== ML Kit Object Detector ======
+  Future<void> _initObjectDetector() async {
+    try {
+      final options = ObjectDetectorOptions(
+        mode: DetectionMode.single,
+        classifyObjects: true,
+        multipleObjects: true,
+      );
+      _objectDetector = ObjectDetector(options: options);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  void _processCameraImage(CameraImage image) {
+    if (_objectDetector == null || _isDetecting) return;
+    _frameCounter++;
+    if (_frameCounter % _detectEveryNFrames != 0) return;
+    _isDetecting = true;
+    _runDetection(image);
+  }
+
+  Future<void> _runDetection(CameraImage image) async {
+    try {
+      final detector = _objectDetector;
+      if (detector == null) {
+        _isDetecting = false;
+        return;
+      }
+      final inputImage = _buildInputImage(image);
+      if (inputImage == null) {
+        _isDetecting = false;
+        return;
+      }
+      final List<DetectedObject> objects = await detector.processImage(inputImage);
+      _onDetectionsReady(objects, inputImage.metadata!.size);
+    } catch (e) {
+      // ignore
+    } finally {
+      _isDetecting = false;
+    }
+  }
+
+  InputImage? _buildInputImage(CameraImage image) {
+    if (image.planes.length < 3) return null;
+    // Build NV21 buffer: Y plane + interleaved VU plane
+    // (YUV_420_888 has 3 separate planes; NV21 = Y + VU interleaved)
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+    final ySize = yPlane.bytes.length;
+    // Truncate U/V to same length (U/V planes are usually same size in 420)
+    final uvSize = math.min(uPlane.bytes.length, vPlane.bytes.length);
+    final nv21 = Uint8List(ySize + 2 * uvSize);
+    // Copy Y
+    nv21.setRange(0, ySize, yPlane.bytes);
+    // Interleave VU (NV21: V first, then U)
+    int idx = ySize;
+    for (int i = 0; i < uvSize; i++) {
+      nv21[idx++] = vPlane.bytes[i];
+      nv21[idx++] = uPlane.bytes[i];
+    }
+    // Sensor orientation
+    final cam = _cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => _cameras.first,
+    );
+    final sensorOrientation = cam.sensorOrientation;
+    InputImageRotation rotation;
+    if (sensorOrientation == 0) {
+      rotation = InputImageRotation.rotation0deg;
+    } else if (sensorOrientation == 90) {
+      rotation = InputImageRotation.rotation90deg;
+    } else if (sensorOrientation == 180) {
+      rotation = InputImageRotation.rotation180deg;
+    } else {
+      rotation = InputImageRotation.rotation270deg;
+    }
+    final metadata = InputImageMetadata(
+      size: Size(image.width.toDouble(), image.height.toDouble()),
+      rotation: rotation,
+      format: InputImageFormat.nv21,
+      bytesPerRow: image.width, // NV21 row stride = image width (after rotation, width = original height)
+    );
+    return InputImage.fromBytes(bytes: nv21, metadata: metadata);
+  }
+
+  void _onDetectionsReady(List<DetectedObject> objects, Size imageSize) {
+    if (!mounted) return;
+    final now = DateTime.now();
+    // Cập nhật danh sách detection (giữ 3s)
+    _detections.removeWhere((d) => d.ageSeconds > _detectionLifetimeSec);
+    final counts = <String, int>{};
+    String topLabel = '--';
+    double topConf = 0;
+    for (final obj in objects) {
+      // Lấy label đầu tiên (highest confidence)
+      String label = 'Object';
+      double conf = 0;
+      if (obj.labels.isNotEmpty) {
+        obj.labels.sort((a, b) => b.confidence.compareTo(a.confidence));
+        label = obj.labels.first.text;
+        conf = obj.labels.first.confidence;
+      }
+      counts[label] = (counts[label] ?? 0) + 1;
+      if (conf > topConf) {
+        topConf = conf;
+        topLabel = label;
+      }
+      _detections.add(_DetectedObj(
+        label: label,
+        confidence: conf,
+        boundingBox: obj.boundingBox,
+        detectedAt: now,
+      ));
+    }
+    // Cap detections list
+    if (_detections.length > 60) {
+      _detections.removeRange(0, _detections.length - 60);
+    }
+    setState(() {
+      _objectCounts
+        ..clear()
+        ..addAll(counts);
+      _topLabel = topLabel;
+      _topConfidence = topConf;
+    });
+  }
+
+  void _checkGhostCombo() {
+    final bool hasAudioAlarm = _isAlarming;
+    final bool hasVisualDetection = _detections.isNotEmpty;
+    final bool newCombo = hasAudioAlarm && hasVisualDetection;
+    if (newCombo && !_ghostCombo) {
+      _comboCount++;
+      // Combo haptic mạnh hơn
+      HapticFeedback.heavyImpact();
+      SystemSound.play(SystemSoundType.click);
+    }
+    _ghostCombo = newCombo;
   }
 
   // ====== Compass helpers ======
@@ -400,6 +590,11 @@ class _RadarScreenState extends State<RadarScreen>
     _target = null;
     _dominantBandName = '--';
     _dominantBandHz = 0;
+    _comboCount = 0;
+    _ghostCombo = false;
+    _detections.clear();
+    _objectCounts.clear();
+    _topLabel = '--';
 
     _analysisTimer?.cancel();
     _analysisTimer = Timer.periodic(
@@ -409,11 +604,10 @@ class _RadarScreenState extends State<RadarScreen>
 
     setState(() {
       _isScanning = true;
-      _statusText = 'ĐANG QUÉT 0–20 Hz';
+      _statusText = 'ĐANG QUÉT 0–20 Hz + ML';
       _noteText = _hasCompass
-          ? 'Đang quét + camera âm bản. Cầm thẳng đứng, xoay người chậm để dò hướng. '
-              'Sau ~6s có baseline.'
-          : 'Đang quét + camera âm bản. Không đọc được la bàn — hướng blip sẽ không chính xác.';
+          ? 'Mic dò âm thanh hạ tần + camera dò đối tượng real-time. Cả hai cùng trigger = GHOST COMBO. Cầm thẳng đứng, xoay người chậm để dò hướng.'
+          : 'Mic dò 0-20Hz + camera dò object. Không đọc được la bàn — hướng blip sẽ không chính xác.';
     });
   }
 
@@ -436,13 +630,13 @@ class _RadarScreenState extends State<RadarScreen>
       _isAlarming = false;
       _statusText = 'ĐÃ DỪNG';
       _noteText =
-          'Đã dừng. Báo động: $_alarmCount lần · Blip trên radar: ${_blips.length}';
+          'Đã dừng. Báo động: $_alarmCount lần · Blip: ${_blips.length} · Ghost combo: $_comboCount';
     });
   }
 
   void toggleMute() => setState(() => _alarmMuted = !_alarmMuted);
 
-  // ====== Audio callback: PCM → anti-alias → decimate → circular buffer ======
+  // ====== Audio callback ======
   void _onAudioData(Uint8List bytes) {
     if (bytes.isEmpty) return;
     final List<int> ints = _recorder!.convertBytesToInt16(bytes);
@@ -644,7 +838,6 @@ class _RadarScreenState extends State<RadarScreen>
       _alarmCount += 1;
       _lastAlarmSummary =
           '${_bandNames[band]} · ≈ ${hz.toStringAsFixed(1)} Hz · ${ratio.toStringAsFixed(1)}× nền';
-      // Bắt đầu vòng lặp haptic: check mute state mỗi tick
       _alarmHapticTimer?.cancel();
       _alarmHapticTimer = Timer.periodic(
         const Duration(milliseconds: 350),
@@ -683,10 +876,9 @@ class _RadarScreenState extends State<RadarScreen>
   // ====== UI ======
   @override
   Widget build(BuildContext context) {
-    final bool alarm = _isAlarming;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('GHOST RADAR · 0–20 Hz · IR'),
+        title: const Text('GHOST RADAR · 0–20 Hz · ML · IR'),
         centerTitle: true,
         backgroundColor: Colors.black,
         elevation: 0,
@@ -697,18 +889,21 @@ class _RadarScreenState extends State<RadarScreen>
           child: Column(
             children: [
               _alarmBanner(),
-              // ===== 2 cột: radar (trái) + camera âm bản (phải) =====
+              if (_ghostCombo) _comboBanner(),
+              // ===== 2 cột: radar (trái) + camera IR + ML (phải) =====
               SizedBox(
-                height: 270,
+                height: 300,
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Expanded(child: _radarPanel(alarm)),
+                    Expanded(child: _radarPanel()),
                     const SizedBox(width: 8),
-                    Expanded(child: _cameraPanel(alarm)),
+                    Expanded(child: _cameraPanel()),
                   ],
                 ),
               ),
+              const SizedBox(height: 8),
+              _detectionPanel(),
               const SizedBox(height: 8),
               _infoPanel(),
               const SizedBox(height: 8),
@@ -732,7 +927,7 @@ class _RadarScreenState extends State<RadarScreen>
     if (!_isAlarming) return const SizedBox.shrink();
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 8),
+      margin: const EdgeInsets.only(bottom: 6),
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
       decoration: BoxDecoration(
         color: const Color(0xFFFF3B3B),
@@ -740,7 +935,7 @@ class _RadarScreenState extends State<RadarScreen>
       ),
       child: Row(
         children: [
-          const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 24),
+          const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 22),
           const SizedBox(width: 6),
           Expanded(
             child: Text(
@@ -757,19 +952,56 @@ class _RadarScreenState extends State<RadarScreen>
     );
   }
 
-  Widget _radarPanel(bool alarm) {
+  Widget _comboBanner() {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 10),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFFFF0080), Color(0xFFFF3B3B)],
+        ),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFFFF0080).withOpacity(0.6),
+            blurRadius: 20,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: const Row(
+        children: [
+          Icon(Icons.flash_on, color: Colors.white, size: 26),
+          SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              '👻 GHOST COMBO · Audio + Visual cùng dò được',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 13,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _radarPanel() {
     return AnimatedContainer(
       duration: const Duration(milliseconds: 120),
       decoration: BoxDecoration(
         color: Colors.black,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: alarm
+          color: _isAlarming
               ? const Color(0xFFFF3B3B)
               : const Color(0xFF1FE033).withOpacity(0.5),
-          width: alarm ? 4.0 : 1.5,
+          width: _isAlarming ? 4.0 : 1.5,
         ),
-        boxShadow: alarm
+        boxShadow: _isAlarming
             ? [
                 BoxShadow(
                   color: const Color(0xFFFF3B3B).withOpacity(0.45),
@@ -787,7 +1019,7 @@ class _RadarScreenState extends State<RadarScreen>
                 sweepAngleDeg: _angle,
                 headingDeg: _heading,
                 level: _level,
-                alarm: alarm,
+                alarm: _isAlarming,
                 blips: List<_Blip>.unmodifiable(_blips),
                 target: _target,
                 hasCompass: _hasCompass,
@@ -812,10 +1044,14 @@ class _RadarScreenState extends State<RadarScreen>
     );
   }
 
-  Widget _cameraPanel(bool alarm) {
-    final Color borderColor = alarm
-        ? const Color(0xFFFF3B3B)
-        : const Color(0xFF1FE033).withOpacity(0.5);
+  Widget _cameraPanel() {
+    final Color borderColor = _ghostCombo
+        ? const Color(0xFFFF0080)
+        : (_isAlarming
+            ? const Color(0xFFFF3B3B)
+            : (_detections.isNotEmpty
+                ? const Color(0xFF1FE033)
+                : const Color(0xFF1FE033).withOpacity(0.5)));
     return AnimatedContainer(
       duration: const Duration(milliseconds: 120),
       decoration: BoxDecoration(
@@ -823,17 +1059,25 @@ class _RadarScreenState extends State<RadarScreen>
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
           color: borderColor,
-          width: alarm ? 4.0 : 1.5,
+          width: (_isAlarming || _ghostCombo) ? 4.0 : 1.5,
         ),
-        boxShadow: alarm
+        boxShadow: _ghostCombo
             ? [
                 BoxShadow(
-                  color: const Color(0xFFFF3B3B).withOpacity(0.45),
-                  blurRadius: 20,
+                  color: const Color(0xFFFF0080).withOpacity(0.55),
+                  blurRadius: 22,
                   spreadRadius: 2,
                 ),
               ]
-            : null,
+            : _isAlarming
+                ? [
+                    BoxShadow(
+                      color: const Color(0xFFFF3B3B).withOpacity(0.45),
+                      blurRadius: 20,
+                      spreadRadius: 2,
+                    ),
+                  ]
+                : null,
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(11),
@@ -841,6 +1085,8 @@ class _RadarScreenState extends State<RadarScreen>
           fit: StackFit.expand,
           children: [
             _cameraContent(),
+            // Bounding boxes cho ML Kit detections
+            _detectionOverlay(),
             // Scanlines retro
             IgnorePointer(
               child: Column(
@@ -861,11 +1107,21 @@ class _RadarScreenState extends State<RadarScreen>
               left: 4,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                color: alarm
-                    ? const Color(0xFFFF3B3B).withOpacity(0.85)
-                    : const Color(0xFF1FE033).withOpacity(0.75),
+                color: _ghostCombo
+                    ? const Color(0xFFFF0080).withOpacity(0.95)
+                    : (_isAlarming
+                        ? const Color(0xFFFF3B3B).withOpacity(0.85)
+                        : (_detections.isNotEmpty
+                            ? const Color(0xFF1FE033).withOpacity(0.85)
+                            : const Color(0xFF1FE033).withOpacity(0.75))),
                 child: Text(
-                  alarm ? 'IR · ALARM' : 'IR · ÂM BẢN',
+                  _ghostCombo
+                      ? '👻 COMBO'
+                      : (_isAlarming
+                          ? 'IR · ALARM'
+                          : (_detections.isNotEmpty
+                              ? 'IR · ML · ${_objectCounts.values.fold(0, (a, b) => a + b)} obj'
+                              : 'IR · ÂM BẢN')),
                   style: const TextStyle(
                       fontSize: 9,
                       color: Colors.black,
@@ -873,13 +1129,13 @@ class _RadarScreenState extends State<RadarScreen>
                 ),
               ),
             ),
-            // Crosshair overlay
+            // Crosshair
             Center(
               child: IgnorePointer(
                 child: SizedBox(
                   width: 50,
                   height: 50,
-                  child: CustomPaint(painter: _CrosshairPainter(alarm: alarm)),
+                  child: CustomPaint(painter: _CrosshairPainter(alarm: _isAlarming || _ghostCombo)),
                 ),
               ),
             ),
@@ -950,6 +1206,129 @@ class _RadarScreenState extends State<RadarScreen>
     );
   }
 
+  Widget _detectionOverlay() {
+    if (_detections.isEmpty) return const SizedBox.shrink();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // CameraPreview dùng FittedBox.cover với SizedBox(previewSize).
+        // Tính scale + offset để map image coords sang display coords.
+        final Size box = Size(constraints.maxWidth, constraints.maxHeight);
+        Size imgSize;
+        try {
+          final ps = _cameraController?.value.previewSize;
+          if (ps == null) {
+            imgSize = const Size(240, 320);
+          } else {
+            // previewSize = (w, h) ở sensor orientation
+            // CameraPreview widget thường xoay, ta dùng max(w,h) x min(w,h) cho display
+            imgSize = Size(math.max(ps.width, ps.height),
+                math.max(ps.width, ps.height) * (box.height / box.width));
+          }
+        } catch (_) {
+          imgSize = const Size(240, 320);
+        }
+        final double scale =
+            math.max(box.width / imgSize.width, box.height / imgSize.height);
+        final double dx = (box.width - imgSize.width * scale) / 2.0;
+        final double dy = (box.height - imgSize.height * scale) / 2.0;
+        return CustomPaint(
+          painter: _DetectionPainter(
+            detections: _detections,
+            imgSize: imgSize,
+            scale: scale,
+            dx: dx,
+            dy: dy,
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _detectionPanel() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0E0E0E),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: _detections.isNotEmpty
+              ? const Color(0xFF1FE033).withOpacity(0.5)
+              : const Color(0xFF252525),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.center_focus_strong,
+                  color: Color(0xFF1FE033), size: 18),
+              const SizedBox(width: 6),
+              const Text(
+                'ML KIT OBJECT DETECTION',
+                style: TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFFB0B0B0),
+                    fontWeight: FontWeight.bold),
+              ),
+              const Spacer(),
+              if (_objectCounts.isNotEmpty)
+                Text(
+                  '${_objectCounts.values.fold(0, (a, b) => a + b)} đối tượng',
+                  style: const TextStyle(
+                      fontSize: 11, color: Color(0xFF1FE033)),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          if (_objectCounts.isEmpty)
+            const Text(
+              'Chưa phát hiện đối tượng nào. Đưa camera về phía có người/đồ vật.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF808080)),
+            )
+          else
+            Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children: _objectCounts.entries
+                  .map((e) => Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1FE033).withOpacity(0.15),
+                          border: Border.all(
+                              color: const Color(0xFF1FE033)
+                                  .withOpacity(0.5)),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          '${e.key} ×${e.value}',
+                          style: const TextStyle(
+                              fontSize: 11, color: Color(0xFF1FE033)),
+                        ),
+                      ))
+                  .toList(),
+            ),
+          if (_topLabel != '--') ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                const Icon(Icons.bolt, color: Color(0xFFFFB300), size: 14),
+                const SizedBox(width: 4),
+                Text(
+                  'Mạnh nhất: $_topLabel (${(_topConfidence * 100).toStringAsFixed(0)}%)',
+                  style: const TextStyle(
+                      fontSize: 12, color: Color(0xFFFFB300)),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _infoPanel() {
     return Container(
       width: double.infinity,
@@ -957,9 +1336,11 @@ class _RadarScreenState extends State<RadarScreen>
       decoration: BoxDecoration(
         color: const Color(0xFF101010),
         border: Border.all(
-          color: _isAlarming
-              ? const Color(0xFFFF3B3B)
-              : const Color(0xFF1FE033).withOpacity(0.5),
+          color: _ghostCombo
+              ? const Color(0xFFFF0080)
+              : _isAlarming
+                  ? const Color(0xFFFF3B3B)
+                  : const Color(0xFF1FE033).withOpacity(0.5),
         ),
         borderRadius: BorderRadius.circular(8),
       ),
@@ -969,28 +1350,29 @@ class _RadarScreenState extends State<RadarScreen>
           Text(
             _statusText,
             style: TextStyle(
-              fontSize: 16,
-              color: _isAlarming
-                  ? const Color(0xFFFF3B3B)
-                  : const Color(0xFF1FE033),
+              fontSize: 15,
+              color: _ghostCombo
+                  ? const Color(0xFFFF0080)
+                  : _isAlarming
+                      ? const Color(0xFFFF3B3B)
+                      : const Color(0xFF1FE033),
               fontWeight: FontWeight.bold,
             ),
           ),
           const SizedBox(height: 4),
           Text(
             'Dải mạnh nhất: $_dominantBandName · ≈ ${_dominantBandHz.toStringAsFixed(2)} Hz',
-            style: const TextStyle(fontSize: 13),
+            style: const TextStyle(fontSize: 12),
           ),
           Text(
             '🧭 Bạn đang quay mặt về: ${_angleToCompass(_heading)}'
             '${!_hasCompass ? " (không có la bàn)" : ""}',
-            style: const TextStyle(fontSize: 13),
+            style: const TextStyle(fontSize: 12),
           ),
           if (_isScanning)
             Text(
-              'Báo động: $_alarmCount lần · Blip trên radar: ${_blips.length}'
-              ' · Camera: ${_cameraController?.value.isInitialized == true ? "ON" : "OFF"}',
-              style: const TextStyle(fontSize: 12, color: Color(0xFFB0B0B0)),
+              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · Camera ML: ${_cameraController?.value.isInitialized == true ? "ON" : "OFF"}',
+              style: const TextStyle(fontSize: 11, color: Color(0xFFB0B0B0)),
             ),
         ],
       ),
@@ -1137,7 +1519,7 @@ class _RadarScreenState extends State<RadarScreen>
             SizedBox(width: 6),
             Expanded(
               child: Text(
-                '🎯 Mục tiêu: chưa có. Bấm BẮT ĐẦU, xoay người chậm 360° và chờ blip đỏ đầu tiên.',
+                '🎯 Mục tiêu: chưa có. Xoay người chậm 360° và chờ blip đỏ đầu tiên.',
                 style: TextStyle(fontSize: 12, color: Color(0xFF808080)),
               ),
             ),
@@ -1206,7 +1588,7 @@ class _RadarScreenState extends State<RadarScreen>
       child: Text(
         _noteText,
         textAlign: TextAlign.center,
-        style: const TextStyle(fontSize: 12, color: Color(0xFFB0B0B0)),
+        style: const TextStyle(fontSize: 11, color: Color(0xFFB0B0B0)),
       ),
     );
   }
@@ -1224,7 +1606,7 @@ class _RadarScreenState extends State<RadarScreen>
               foregroundColor: Colors.black,
               padding: const EdgeInsets.symmetric(vertical: 11),
               textStyle: const TextStyle(
-                  fontSize: 14, fontWeight: FontWeight.bold),
+                  fontSize: 13, fontWeight: FontWeight.bold),
             ),
           ),
         ),
@@ -1242,7 +1624,7 @@ class _RadarScreenState extends State<RadarScreen>
               foregroundColor: Colors.black,
               padding: const EdgeInsets.symmetric(vertical: 11),
               textStyle: const TextStyle(
-                  fontSize: 14, fontWeight: FontWeight.bold),
+                  fontSize: 13, fontWeight: FontWeight.bold),
             ),
           ),
         ),
@@ -1257,7 +1639,7 @@ class _RadarScreenState extends State<RadarScreen>
               foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(vertical: 11),
               textStyle: const TextStyle(
-                  fontSize: 14, fontWeight: FontWeight.bold),
+                  fontSize: 13, fontWeight: FontWeight.bold),
             ),
           ),
         ),
@@ -1320,7 +1702,7 @@ class _RadarPainter extends CustomPainter {
 
     _drawCompassLabels(canvas, c, rMax);
 
-    // Decorative sweep arc (30°)
+    // Sweep arc 30°
     final sweepPaint = Paint()
       ..shader = SweepGradient(
         startAngle: 0,
@@ -1496,8 +1878,89 @@ class _RadarPainter extends CustomPainter {
 }
 
 // ============================================================
-// Crosshair overlay cho camera panel
+// Detection painter: bounding boxes cho ML Kit detections
 // ============================================================
+class _DetectionPainter extends CustomPainter {
+  _DetectionPainter({
+    required this.detections,
+    required this.imgSize,
+    required this.scale,
+    required this.dx,
+    required this.dy,
+  });
+  final List<_DetectedObj> detections;
+  final Size imgSize;
+  final double scale;
+  final double dx;
+  final double dy;
+
+  Color _colorFor(String label) {
+    // Màu theo class để dễ phân biệt
+    switch (label.toLowerCase()) {
+      case 'person':
+        return const Color(0xFF1FE033);
+      case 'fashion':
+        return const Color(0xFFFFB300);
+      case 'home good':
+      case 'home goods':
+        return const Color(0xFF00BFFF);
+      case 'place':
+        return const Color(0xFFFF80FF);
+      case 'plant':
+        return const Color(0xFF80FF80);
+      case 'food':
+        return const Color(0xFFFF8080);
+      default:
+        return const Color(0xFF1FE033);
+    }
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    for (final d in detections) {
+      // Map từ image coords (đã xoay) → display coords
+      final r = d.boundingBox;
+      // Chuyển từ ảnh đã xoay sang display
+      final Rect mapped = Rect.fromLTWH(
+        dx + r.left * scale,
+        dy + r.top * scale,
+        r.width * scale,
+        r.height * scale,
+      );
+      final Color c = _colorFor(d.label).withOpacity(d.fade);
+      final paint = Paint()
+        ..color = c
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6;
+      canvas.drawRect(mapped, paint);
+      // Label background
+      final tp = TextPainter(
+        text: TextSpan(
+          text: '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}%',
+          style: TextStyle(
+              color: Colors.black, fontSize: 9, fontWeight: FontWeight.bold),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      final labelBg = Rect.fromLTWH(
+        mapped.left,
+        (mapped.top - tp.height - 2).clamp(0.0, size.height - tp.height),
+        tp.width + 4,
+        tp.height + 2,
+      );
+      canvas.drawRect(labelBg, Paint()..color = c);
+      tp.paint(canvas, Offset(labelBg.left + 2, labelBg.top + 1));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DetectionPainter old) =>
+      old.detections.length != detections.length ||
+      old.scale != scale ||
+      old.dx != dx ||
+      old.dy != dy;
+}
+
 class _CrosshairPainter extends CustomPainter {
   _CrosshairPainter({required this.alarm});
   final bool alarm;

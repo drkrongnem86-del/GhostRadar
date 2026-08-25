@@ -1,4 +1,4 @@
-// Ghost Radar v1.4.0 - "Tesla-style" multi-modal ghost detection
+// Ghost Radar v1.5.0 - "Tesla-style" multi-modal ghost detection
 //
 // Audio pipeline (low-freq 0-20Hz):
 //   PCM 44.1kHz → 4-stage IIR anti-alias (25Hz)
@@ -12,19 +12,23 @@
 //   Mỗi alarm → tạo _Blip tại heading hiện tại
 //   Blip fading 8s, blip sáng nhất = "mục tiêu"
 //
-// Camera + ML Kit Object Detection (Tesla-style):
+// Camera + YOLOv8n TFLite Object Detection (Tesla-style):
 //   - Live camera preview với âm bản filter (invert RGB) + scanlines
-//   - startImageStream → CameraImage → InputImage (NV21/YUV_420_888)
-//   - ML Kit ObjectDetector chạy on-device, mỗi 5 frame
-//   - Bounding box overlay vẽ lên preview (màu theo class label)
-//   - Detection list: top object + số object + confidence
+//   - startImageStream → CameraImage (YUV_420_888)
+//   - YUV → RGB (BT.601) → resize 640×640 letterbox → normalize [0,1]
+//   - TFLite interpreter (yolov8n.tflite) → output [1,84,8400]
+//   - Parse 80 COCO class scores + xywh boxes
+//   - NMS (IoU=0.5) để loại bỏ trùng lặp
+//   - IoU-based tracker gán ID ổn định xuyên frame
+//   - Persistence filter: chỉ hiện object thấy ≥3 frame liên tiếp
+//   - Bounding box overlay: màu theo COCO class, label + confidence + track ID
 //   - "Ghost Combo" alert khi audio alarm + visual detection cùng lúc
 //
 // Lưu ý khoa học:
 //   - Phone mic cắt <20Hz bằng phần cứng
 //   - Phone RGB camera không phải IR thật, "âm bản" là giả lập
-//   - ML Kit chỉ detect 5 category (Fashion, Home, Place, Plant, Food)
-//     - vẫn đủ impressive cho demo "ghost hunting"
+//   - YOLOv8n trained on COCO 80-class (person/car/dog/cat/bird/...)
+//   - TensorFlow Lite 0.11.0 chạy CPU inference (no GPU delegate để giảm APK)
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -34,13 +38,477 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
-import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 void main() {
   runApp(const GhostRadarApp());
+}
+
+// ====== COCO 80-class labels (cho YOLOv8) ======
+// Bảng label theo thứ tự index 0..79 mà YOLOv8 trả về
+const List<String> _cocoLabels = <String>[
+  'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+  'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+  'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+  'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag',
+  'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+  'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+  'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana',
+  'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+  'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'dining table',
+  'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+  'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock',
+  'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush',
+];
+
+// Màu highlight theo COCO class (Tesla-style neon palette)
+const Map<String, Color> _cocoColors = <String, Color>{
+  'person': Color(0xFF1FE033), // xanh lá neon
+  'bicycle': Color(0xFFFFB300), // vàng
+  'car': Color(0xFF00E5FF), // cyan
+  'motorcycle': Color(0xFFFF6F00), // cam
+  'airplane': Color(0xFF80D8FF),
+  'bus': Color(0xFF40C4FF),
+  'train': Color(0xFF18FFFF),
+  'truck': Color(0xFF00B8D4),
+  'boat': Color(0xFF84FFFF),
+  'traffic light': Color(0xFFFFEB3B),
+  'fire hydrant': Color(0xFFFF5252),
+  'stop sign': Color(0xFFFF1744),
+  'parking meter': Color(0xFFFFAB91),
+  'bench': Color(0xFFBCAAA4),
+  'bird': Color(0xFFFF80AB),
+  'cat': Color(0xFFFFD180),
+  'dog': Color(0xFFFFAB91),
+  'horse': Color(0xFFA1887F),
+  'sheep': Color(0xFFE0E0E0),
+  'cow': Color(0xFF8D6E63),
+  'elephant': Color(0xFF90A4AE),
+  'bear': Color(0xFF6D4C41),
+  'zebra': Color(0xFFEEEEEE),
+  'giraffe': Color(0xFFFFB74D),
+  'backpack': Color(0xFFB39DDB),
+  'umbrella': Color(0xFF9FA8DA),
+  'handbag': Color(0xFFF48FB1),
+  'tie': Color(0xFF7986CB),
+  'suitcase': Color(0xFF4DB6AC),
+  'frisbee': Color(0xFF81C784),
+  'skis': Color(0xFF4FC3F7),
+  'snowboard': Color(0xFF64B5F6),
+  'sports ball': Color(0xFFFF8A65),
+  'kite': Color(0xFFAED581),
+  'baseball bat': Color(0xFFDCE775),
+  'baseball glove': Color(0xFFFFD54F),
+  'skateboard': Color(0xFFBA68C8),
+  'surfboard': Color(0xFF4DD0E1),
+  'tennis racket': Color(0xFFA5D6A7),
+  'bottle': Color(0xFF90CAF9),
+  'wine glass': Color(0xFFCE93D8),
+  'cup': Color(0xFF80DEEA),
+  'fork': Color(0xFFB0BEC5),
+  'knife': Color(0xFF90A4AE),
+  'spoon': Color(0xFFBDBDBD),
+  'bowl': Color(0xFFFFCC80),
+  'banana': Color(0xFFFFF176),
+  'apple': Color(0xFFE57373),
+  'sandwich': Color(0xFFFFB74D),
+  'orange': Color(0xFFFFB74D),
+  'broccoli': Color(0xFF66BB6A),
+  'carrot': Color(0xFFFF8A65),
+  'hot dog': Color(0xFFFFAB91),
+  'pizza': Color(0xFFFFCC80),
+  'donut': Color(0xFFF8BBD0),
+  'cake': Color(0xFFF48FB1),
+  'chair': Color(0xFFA1887F),
+  'couch': Color(0xFF8D6E63),
+  'potted plant': Color(0xFF81C784),
+  'bed': Color(0xFFBCAAA4),
+  'dining table': Color(0xFFA1887F),
+  'toilet': Color(0xFFE0E0E0),
+  'tv': Color(0xFF64B5F6),
+  'laptop': Color(0xFF42A5F5),
+  'mouse': Color(0xFF90CAF9),
+  'remote': Color(0xFF7986CB),
+  'keyboard': Color(0xFF9FA8DA),
+  'cell phone': Color(0xFF40C4FF),
+  'microwave': Color(0xFFB0BEC5),
+  'oven': Color(0xFF78909C),
+  'toaster': Color(0xFFFFCC80),
+  'sink': Color(0xFF80CBC4),
+  'refrigerator': Color(0xFFB0BEC5),
+  'book': Color(0xFFD7CCC8),
+  'clock': Color(0xFFFFB74D),
+  'vase': Color(0xFFCE93D8),
+  'scissors': Color(0xFF90CAF9),
+  'teddy bear': Color(0xFFBCAAA4),
+  'hair drier': Color(0xFFB0BEC5),
+  'toothbrush': Color(0xFF80CBC4),
+};
+
+Color _colorForCoco(String label) {
+  return _cocoColors[label] ?? const Color(0xFF1FE033);
+}
+
+// ====== YOLOv8n detector (TFLite) ======
+// Detect 80 class COCO, output xywh center-format, post-process gồm:
+//   - lọc theo confidence threshold
+//   - decode class id = argmax(class_scores)
+//   - NMS theo IoU threshold
+class _YoloDetection {
+  _YoloDetection({
+    required this.bbox,
+    required this.classIndex,
+    required this.className,
+    required this.confidence,
+  });
+  final Rect bbox; // xyxy trong image space (đã un-letterbox)
+  final int classIndex;
+  final String className;
+  final double confidence;
+}
+
+class _YoloDetector {
+  _YoloDetector({
+    this.inputSize = 640,
+    this.confThreshold = 0.40,
+    this.iouThreshold = 0.50,
+  });
+  final int inputSize;
+  final double confThreshold;
+  final double iouThreshold;
+
+  Interpreter? _interpreter;
+  late List<int> _inShape;
+  late List<int> _outShape;
+
+  bool get isReady => _interpreter != null;
+
+  Future<void> load() async {
+    try {
+      final opts = InterpreterOptions()
+        ..threads = 4
+        ..useNnApiForAndroid = false; // CPU-only cho Samsung A17 ổn định
+      _interpreter = await Interpreter.fromAsset(
+        'yolov8n.tflite',
+        options: opts,
+      );
+      _inShape = _interpreter!.getInputTensor(0).shape;
+      _outShape = _interpreter!.getOutputTensor(0).shape;
+      // ignore: avoid_print
+      print('YOLO loaded in=${_inShape} out=${_outShape}');
+    } catch (e) {
+      // ignore: avoid_print
+      print('YOLO load fail: $e');
+      rethrow;
+    }
+  }
+
+  // Chuyển YUV_420_888 frame từ camera thành input float32 NCHW đã normalize.
+  // Kết quả: Float32List length = 1*3*inputSize*inputSize, layout NCHW
+  //          (vì TFLite YOLOv8 mặc định nhận NCHW float32)
+  // Đồng thời trả về scale + offset để un-letterbox khi decode box.
+  Float32List preprocessYuv(CameraImage image, double rotationDeg) {
+    final int inW = image.width;
+    final int inH = image.height;
+    final int s = inputSize;
+
+    // Letterbox: scale giữ aspect ratio, pad còn 640x640
+    final double scale = math.min(s / inW, s / inH);
+    final int newW = (inW * scale).round();
+    final int newH = (inH * scale).round();
+    final int padX = (s - newW) ~/ 2;
+    final int padY = (s - newH) ~/ 2;
+
+    final Float32List out = Float32List(1 * 3 * s * s);
+
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+    final yRowStride = yPlane.bytesPerRow;
+    final uvRowStride = uPlane.bytesPerRow;
+    final uvPixStride = uPlane.bytesPerPixel ?? 1;
+    final yBytes = yPlane.bytes;
+    final uBytes = uPlane.bytes;
+    final vBytes = vPlane.bytes;
+
+    // For each output pixel (x, y) in [0, s):
+    //  - map to source (sx, sy) in original image
+    //  - read Y/U/V, convert YUV→RGB, normalize
+    //  - store in NCHW [channel * s * s + y * s + x]
+    for (int oy = 0; oy < s; oy++) {
+      // Map output y → source y (revert letterbox y)
+      final int sy = (((oy - padY) / scale).floor()).clamp(0, inH - 1);
+      for (int ox = 0; ox < s; ox++) {
+        final int sx = (((ox - padX) / scale).floor()).clamp(0, inW - 1);
+        final int yIdx = sy * yRowStride + sx;
+        final int uvIdx = (sy ~/ 2) * uvRowStride + (sx ~/ 2) * uvPixStride;
+        final int yv = yBytes[yIdx];
+        final int uv = uBytes[uvIdx];
+        final int vv = vBytes[uvIdx];
+        // BT.601 limited range: R = Y + 1.402*(V-128)
+        //                       G = Y - 0.344136*(U-128) - 0.714136*(V-128)
+        //                       B = Y + 1.772*(U-128)
+        double r = yv + 1.402 * (vv - 128);
+        double g = yv - 0.344136 * (uv - 128) - 0.714136 * (vv - 128);
+        double b = yv + 1.772 * (uv - 128);
+        r = r.clamp(0, 255) / 255.0;
+        g = g.clamp(0, 255) / 255.0;
+        b = b.clamp(0, 255) / 255.0;
+        // NCHW layout: index = c*s*s + oy*s + ox
+        final int base = oy * s + ox;
+        out[0 * s * s + base] = r;
+        out[1 * s * s + base] = g;
+        out[2 * s * s + base] = b;
+      }
+    }
+    // RotationDeg is reserved (nếu cần transpose sau này)
+    return out;
+  }
+
+  // Run inference. Returns raw output [1, 84, 8400] (Float32List).
+  Float32List runInference(Float32List input) {
+    final interp = _interpreter!;
+    // Reshape input về [1, 3, s, s]
+    final inputReshaped = input.reshape([1, 3, inputSize, inputSize]);
+    // Output buffer: shape [1, 84, 8400] (YOLOv8 export mặc định)
+    final int outH = _outShape[1]; // 84
+    final int outW = _outShape[2]; // 8400
+    final Float32List rawOut = Float32List(outH * outW);
+    final outReshaped = rawOut.reshape([1, outH, outW]);
+    interp.run(inputReshaped, outReshaped);
+    return rawOut;
+  }
+
+  // Decode output [1, 84, 8400] → List<_YoloDetection> sau NMS
+  // Layout: 84 = [x_center, y_center, w, h, class0_score, ..., class79_score]
+  //        8400 anchors. output transpose: out[channel, anchor] - cần loop theo anchor
+  List<_YoloDetection> postprocess(
+    Float32List rawOut,
+    int origW,
+    int origH, {
+    int letterboxPadX = 0,
+    int letterboxPadY = 0,
+    double letterboxScale = 1.0,
+  }) {
+    final int outH = _outShape[1]; // 84
+    final int outW = _outShape[2]; // 8400
+    // Bước 1: filter theo confidence (max class score > threshold)
+    final List<_YoloDetection> candidates = <_YoloDetection>[];
+    for (int a = 0; a < outW; a++) {
+      // Find max class score
+      double maxScore = 0;
+      int maxClass = 0;
+      for (int c = 4; c < outH; c++) {
+        final double s = rawOut[c * outW + a];
+        if (s > maxScore) {
+          maxScore = s;
+          maxClass = c - 4;
+        }
+      }
+      if (maxScore < confThreshold) continue;
+      // Box: out[0..3, a] = x_center, y_center, w, h (in 640x640 space)
+      final double cx = rawOut[0 * outW + a];
+      final double cy = rawOut[1 * outW + a];
+      final double w = rawOut[2 * outW + a];
+      final double h = rawOut[3 * outW + a];
+      // Un-letterbox: về original image coords
+      final double cx0 = (cx - letterboxPadX) / letterboxScale;
+      final double cy0 = (cy - letterboxPadY) / letterboxScale;
+      final double w0 = w / letterboxScale;
+      final double h0 = h / letterboxScale;
+      final double x0 = (cx0 - w0 / 2).clamp(0.0, origW.toDouble());
+      final double y0 = (cy0 - h0 / 2).clamp(0.0, origH.toDouble());
+      final double x1 = (cx0 + w0 / 2).clamp(0.0, origW.toDouble());
+      final double y1 = (cy0 + h0 / 2).clamp(0.0, origH.toDouble());
+      candidates.add(_YoloDetection(
+        bbox: Rect.fromLTRB(x0, y0, x1, y1),
+        classIndex: maxClass,
+        className: maxClass >= 0 && maxClass < _cocoLabels.length
+            ? _cocoLabels[maxClass]
+            : 'cls$maxClass',
+        confidence: maxScore,
+      ));
+    }
+    // Bước 2: NMS
+    return _nms(candidates, iouThreshold);
+  }
+
+  // Compute letterbox params từ image dims
+  ({int padX, int padY, double scale}) computeLetterbox(int w, int h) {
+    final double scale = math.min(inputSize / w, inputSize / h);
+    final int newW = (w * scale).round();
+    final int newH = (h * scale).round();
+    return (
+      padX: (inputSize - newW) ~/ 2,
+      padY: (inputSize - newH) ~/ 2,
+      scale: scale,
+    );
+  }
+
+  void close() {
+    _interpreter?.close();
+    _interpreter = null;
+  }
+
+  // Non-Maximum Suppression theo IoU
+  static List<_YoloDetection> _nms(
+    List<_YoloDetection> dets,
+    double iouThresh,
+  ) {
+    if (dets.isEmpty) return dets;
+    // Sort giảm dần theo confidence
+    dets.sort((a, b) => b.confidence.compareTo(a.confidence));
+    final List<_YoloDetection> keep = <_YoloDetection>[];
+    final List<bool> suppressed = List<bool>.filled(dets.length, false);
+    for (int i = 0; i < dets.length; i++) {
+      if (suppressed[i]) continue;
+      keep.add(dets[i]);
+      for (int j = i + 1; j < dets.length; j++) {
+        if (suppressed[j]) continue;
+        if (dets[i].classIndex != dets[j].classIndex) continue;
+        if (_iou(dets[i].bbox, dets[j].bbox) > iouThresh) {
+          suppressed[j] = true;
+        }
+      }
+    }
+    return keep;
+  }
+
+  static double _iou(Rect a, Rect b) {
+    final double ix0 = math.max(a.left, b.left);
+    final double iy0 = math.max(a.top, b.top);
+    final double ix1 = math.min(a.right, b.right);
+    final double iy1 = math.min(a.bottom, b.bottom);
+    final double iw = math.max(0.0, ix1 - ix0);
+    final double ih = math.max(0.0, iy1 - iy0);
+    final double inter = iw * ih;
+    final double union = a.width * a.height + b.width * b.height - inter;
+    if (union <= 0) return 0;
+    return inter / union;
+  }
+}
+
+// ====== IoU-based tracker (single-class-agnostic: match theo bbox) ======
+// Mỗi track giữ bbox history + số frame đã thấy. Status tentative → confirmed.
+class _Track {
+  _Track({
+    required this.id,
+    required this.className,
+    required this.bbox,
+    required this.confidence,
+    required this.lastSeen,
+  });
+  final int id;
+  String className;
+  Rect bbox;
+  double confidence;
+  DateTime lastSeen;
+  int framesSeen = 1;
+  int missedFrames = 0;
+  // Lịch sử bbox (để vẽ trail fade)
+  final List<Rect> history = <Rect>[];
+  static const int _maxHistory = 12;
+  bool get isConfirmed => framesSeen >= 3;
+  void update(Rect newBbox, String newClass, double newConf, DateTime now) {
+    bbox = newBbox;
+    className = newClass;
+    confidence = newConf;
+    lastSeen = now;
+    framesSeen++;
+    missedFrames = 0;
+    history.add(newBbox);
+    if (history.length > _maxHistory) history.removeAt(0);
+  }
+  void markMissed() {
+    missedFrames++;
+  }
+}
+
+class _Tracker {
+  _Tracker({this.iouMatchThreshold = 0.30, this.maxMissedFrames = 5});
+  final double iouMatchThreshold;
+  final int maxMissedFrames;
+  int _nextId = 1;
+  final Map<int, _Track> _tracks = <int, _Track>{};
+  // Tracks còn "fresh" để hiển thị
+  List<_Track> get active {
+    return _tracks.values
+        .where((t) => t.missedFrames <= maxMissedFrames)
+        .toList();
+  }
+
+  // Update: input detections không có ID → match với track hiện tại qua IoU
+  // Output: List<_Track> (active tracks sau update, có ID ổn định)
+  List<_Track> update(List<_YoloDetection> dets, DateTime now) {
+    // 1. Đánh dấu tất cả track chưa match
+    final List<int> matchedTrackIds = <int>[];
+    final List<bool> detMatched = List<bool>.filled(dets.length, false);
+
+    // 2. Với mỗi detection, tìm track tốt nhất (cùng class + IoU cao nhất)
+    for (int di = 0; di < dets.length; di++) {
+      final _YoloDetection det = dets[di];
+      int? bestTrackId;
+      double bestIou = iouMatchThreshold;
+      for (final t in _tracks.values) {
+        if (matchedTrackIds.contains(t.id)) continue;
+        if (t.className != det.className) continue;
+        final double iou = _iou(t.bbox, det.bbox);
+        if (iou > bestIou) {
+          bestIou = iou;
+          bestTrackId = t.id;
+        }
+      }
+      if (bestTrackId != null) {
+        final t = _tracks[bestTrackId]!;
+        t.update(det.bbox, det.className, det.confidence, now);
+        matchedTrackIds.add(bestTrackId);
+        detMatched[di] = true;
+      }
+    }
+
+    // 3. Detection chưa match → tạo track mới
+    for (int di = 0; di < dets.length; di++) {
+      if (detMatched[di]) continue;
+      final det = dets[di];
+      final t = _Track(
+        id: _nextId++,
+        className: det.className,
+        bbox: det.bbox,
+        confidence: det.confidence,
+        lastSeen: now,
+      );
+      t.history.add(det.bbox);
+      _tracks[t.id] = t;
+    }
+
+    // 4. Track không match → tăng missed
+    for (final t in _tracks.values) {
+      if (!matchedTrackIds.contains(t.id)) {
+        t.markMissed();
+      }
+    }
+
+    // 5. Xóa track quá miss
+    _tracks.removeWhere((_, t) => t.missedFrames > maxMissedFrames);
+
+    return active;
+  }
+
+  static double _iou(Rect a, Rect b) {
+    final double ix0 = math.max(a.left, b.left);
+    final double iy0 = math.max(a.top, b.top);
+    final double ix1 = math.min(a.right, b.right);
+    final double iy1 = math.min(a.bottom, b.bottom);
+    final double iw = math.max(0.0, ix1 - ix0);
+    final double ih = math.max(0.0, iy1 - iy0);
+    final double inter = iw * ih;
+    final double union = a.width * a.height + b.width * b.height - inter;
+    if (union <= 0) return 0;
+    return inter / union;
+  }
 }
 
 class GhostRadarApp extends StatelessWidget {
@@ -88,13 +556,17 @@ class _DetectedObj {
   _DetectedObj({
     required this.label,
     required this.confidence,
-    required this.boundingBox, // Rect in image pixel coordinates (after rotation)
+    required this.boundingBox, // Rect in image pixel coordinates
     required this.detectedAt,
+    this.trackId,
+    this.trackHistory,
   });
   final String label;
   final double confidence;
   final Rect boundingBox;
   final DateTime detectedAt;
+  final int? trackId;
+  final List<Rect>? trackHistory;
 
   double get ageSeconds =>
       DateTime.now().difference(detectedAt).inMilliseconds / 1000.0;
@@ -159,19 +631,20 @@ class _RadarScreenState extends State<RadarScreen>
   StreamSubscription<AccelerometerEvent>? _accelSub;
   StreamSubscription<MagnetometerEvent>? _magSub;
 
-  // ====== Camera + ML Kit ======
+  // ====== Camera + YOLOv8n TFLite ======
   CameraController? _cameraController;
   List<CameraDescription> _cameras = <CameraDescription>[];
   String _cameraError = '';
-  ObjectDetector? _objectDetector;
+  _YoloDetector? _yolo;
+  final _Tracker _tracker = _Tracker();
   bool _isDetecting = false;
   int _frameCounter = 0;
   static const int _detectEveryNFrames = 5; // xử lý mỗi 5 frame
 
-  // Detected objects (giữ ~3 giây history)
+  // Confirmed tracks (giữ ~3 giây history) - dùng để render
   final List<_DetectedObj> _detections = <_DetectedObj>[];
   static const double _detectionLifetimeSec = 3.0;
-  // Map: label → count (đếm nhanh)
+  // Map: label → count (đếm nhanh các track confirmed)
   final Map<String, int> _objectCounts = <String, int>{};
   // Top detection
   String _topLabel = '--';
@@ -195,7 +668,7 @@ class _RadarScreenState extends State<RadarScreen>
   bool _isScanning = false;
   String _statusText = 'CHƯA KHỞI ĐỘNG';
   String _noteText =
-      'Bấm BẮT ĐẦU QUÉT. Mic dò 0-20Hz, camera dò đối tượng real-time. Khi cả hai cùng trigger → GHOST COMBO 🔴';
+      'Bấm BẤT ĐẦU QUÉT. Mic dò 0-20Hz, camera YOLOv8n 80-class COCO real-time + NMS + tracking. Cùng trigger → GHOST COMBO 🔴';
   double _level = 0.0;
   double _angle = 0.0;
   double _sensitivity = 2.5;
@@ -259,7 +732,7 @@ class _RadarScreenState extends State<RadarScreen>
     _streamSub?.cancel();
     _accelSub?.cancel();
     _magSub?.cancel();
-    _objectDetector?.close();
+    _yolo?.close();
     _recorder?.dispose();
     _cameraController?.dispose();
     super.dispose();
@@ -373,22 +846,24 @@ class _RadarScreenState extends State<RadarScreen>
     }
   }
 
-  // ====== ML Kit Object Detector ======
+  // ====== YOLOv8n TFLite Object Detector ======
   Future<void> _initObjectDetector() async {
     try {
-      final options = ObjectDetectorOptions(
-        mode: DetectionMode.single,
-        classifyObjects: true,
-        multipleObjects: true,
+      _yolo = _YoloDetector(
+        inputSize: 640,
+        confThreshold: 0.40,
+        iouThreshold: 0.50,
       );
-      _objectDetector = ObjectDetector(options: options);
+      await _yolo!.load();
     } catch (e) {
-      // ignore
+      if (mounted) {
+        setState(() => _cameraError = 'YOLO load fail: $e');
+      }
     }
   }
 
   void _processCameraImage(CameraImage image) {
-    if (_objectDetector == null || _isDetecting) return;
+    if (_yolo == null || !_yolo!.isReady || _isDetecting) return;
     _frameCounter++;
     if (_frameCounter % _detectEveryNFrames != 0) return;
     _isDetecting = true;
@@ -397,18 +872,30 @@ class _RadarScreenState extends State<RadarScreen>
 
   Future<void> _runDetection(CameraImage image) async {
     try {
-      final detector = _objectDetector;
-      if (detector == null) {
+      final yolo = _yolo;
+      if (yolo == null || !yolo.isReady) {
         _isDetecting = false;
         return;
       }
-      final inputImage = _buildInputImage(image);
-      if (inputImage == null) {
-        _isDetecting = false;
-        return;
-      }
-      final List<DetectedObject> objects = await detector.processImage(inputImage);
-      _onDetectionsReady(objects, inputImage.metadata!.size);
+      // 1. Letterbox params (giữ aspect ratio)
+      final lb = yolo.computeLetterbox(image.width, image.height);
+      // 2. Preprocess: YUV→RGB→640x640 letterbox→normalize NCHW
+      final input = yolo.preprocessYuv(image, 0);
+      // 3. Inference
+      final raw = yolo.runInference(input);
+      // 4. Postprocess: decode + NMS
+      final dets = yolo.postprocess(
+        raw,
+        image.width,
+        image.height,
+        letterboxPadX: lb.padX,
+        letterboxPadY: lb.padY,
+        letterboxScale: lb.scale,
+      );
+      // 5. Tracker update → trả về active tracks
+      final now = DateTime.now();
+      final activeTracks = _tracker.update(dets, now);
+      _onDetectionsReady(activeTracks, Size(image.width.toDouble(), image.height.toDouble()));
     } catch (e) {
       // ignore
     } finally {
@@ -416,51 +903,7 @@ class _RadarScreenState extends State<RadarScreen>
     }
   }
 
-  InputImage? _buildInputImage(CameraImage image) {
-    if (image.planes.length < 3) return null;
-    // Build NV21 buffer: Y plane + interleaved VU plane
-    // (YUV_420_888 has 3 separate planes; NV21 = Y + VU interleaved)
-    final yPlane = image.planes[0];
-    final uPlane = image.planes[1];
-    final vPlane = image.planes[2];
-    final ySize = yPlane.bytes.length;
-    // Truncate U/V to same length (U/V planes are usually same size in 420)
-    final uvSize = math.min(uPlane.bytes.length, vPlane.bytes.length);
-    final nv21 = Uint8List(ySize + 2 * uvSize);
-    // Copy Y
-    nv21.setRange(0, ySize, yPlane.bytes);
-    // Interleave VU (NV21: V first, then U)
-    int idx = ySize;
-    for (int i = 0; i < uvSize; i++) {
-      nv21[idx++] = vPlane.bytes[i];
-      nv21[idx++] = uPlane.bytes[i];
-    }
-    // Sensor orientation
-    final cam = _cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => _cameras.first,
-    );
-    final sensorOrientation = cam.sensorOrientation;
-    InputImageRotation rotation;
-    if (sensorOrientation == 0) {
-      rotation = InputImageRotation.rotation0deg;
-    } else if (sensorOrientation == 90) {
-      rotation = InputImageRotation.rotation90deg;
-    } else if (sensorOrientation == 180) {
-      rotation = InputImageRotation.rotation180deg;
-    } else {
-      rotation = InputImageRotation.rotation270deg;
-    }
-    final metadata = InputImageMetadata(
-      size: Size(image.width.toDouble(), image.height.toDouble()),
-      rotation: rotation,
-      format: InputImageFormat.nv21,
-      bytesPerRow: image.width, // NV21 row stride = image width (after rotation, width = original height)
-    );
-    return InputImage.fromBytes(bytes: nv21, metadata: metadata);
-  }
-
-  void _onDetectionsReady(List<DetectedObject> objects, Size imageSize) {
+  void _onDetectionsReady(List<_Track> tracks, Size imageSize) {
     if (!mounted) return;
     final now = DateTime.now();
     // Cập nhật danh sách detection (giữ 3s)
@@ -468,25 +911,21 @@ class _RadarScreenState extends State<RadarScreen>
     final counts = <String, int>{};
     String topLabel = '--';
     double topConf = 0;
-    for (final obj in objects) {
-      // Lấy label đầu tiên (highest confidence)
-      String label = 'Object';
-      double conf = 0;
-      if (obj.labels.isNotEmpty) {
-        obj.labels.sort((a, b) => b.confidence.compareTo(a.confidence));
-        label = obj.labels.first.text;
-        conf = obj.labels.first.confidence;
-      }
-      counts[label] = (counts[label] ?? 0) + 1;
-      if (conf > topConf) {
-        topConf = conf;
-        topLabel = label;
+    // Chỉ render tracks confirmed (đã thấy ≥3 frame) - persistence filter
+    for (final t in tracks) {
+      if (!t.isConfirmed) continue;
+      counts[t.className] = (counts[t.className] ?? 0) + 1;
+      if (t.confidence > topConf) {
+        topConf = t.confidence;
+        topLabel = t.className;
       }
       _detections.add(_DetectedObj(
-        label: label,
-        confidence: conf,
-        boundingBox: obj.boundingBox,
+        label: t.className,
+        confidence: t.confidence,
+        boundingBox: t.bbox,
         detectedAt: now,
+        trackId: t.id,
+        trackHistory: List<Rect>.from(t.history),
       ));
     }
     // Cap detections list
@@ -1120,7 +1559,7 @@ class _RadarScreenState extends State<RadarScreen>
                       : (_isAlarming
                           ? 'IR · ALARM'
                           : (_detections.isNotEmpty
-                              ? 'IR · ML · ${_objectCounts.values.fold(0, (a, b) => a + b)} obj'
+                              ? 'YOLO · ${_objectCounts.values.fold(0, (a, b) => a + b)} obj'
                               : 'IR · ÂM BẢN')),
                   style: const TextStyle(
                       fontSize: 9,
@@ -1894,62 +2333,88 @@ class _DetectionPainter extends CustomPainter {
   final double dx;
   final double dy;
 
-  Color _colorFor(String label) {
-    // Màu theo class để dễ phân biệt
-    switch (label.toLowerCase()) {
-      case 'person':
-        return const Color(0xFF1FE033);
-      case 'fashion':
-        return const Color(0xFFFFB300);
-      case 'home good':
-      case 'home goods':
-        return const Color(0xFF00BFFF);
-      case 'place':
-        return const Color(0xFFFF80FF);
-      case 'plant':
-        return const Color(0xFF80FF80);
-      case 'food':
-        return const Color(0xFFFF8080);
-      default:
-        return const Color(0xFF1FE033);
-    }
+  Rect _mapRect(Rect r) {
+    return Rect.fromLTWH(
+      dx + r.left * scale,
+      dy + r.top * scale,
+      r.width * scale,
+      r.height * scale,
+    );
   }
 
   @override
   void paint(Canvas canvas, Size size) {
     for (final d in detections) {
-      // Map từ image coords (đã xoay) → display coords
-      final r = d.boundingBox;
-      // Chuyển từ ảnh đã xoay sang display
-      final Rect mapped = Rect.fromLTWH(
-        dx + r.left * scale,
-        dy + r.top * scale,
-        r.width * scale,
-        r.height * scale,
-      );
-      final Color c = _colorFor(d.label).withOpacity(d.fade);
-      final paint = Paint()
-        ..color = c
+      final Rect mapped = _mapRect(d.boundingBox);
+      final Color c = _colorForCoco(d.label);
+      final double fade = d.fade;
+      // ----- 1. Trail history (fading polylines) -----
+      final hist = d.trackHistory;
+      if (hist != null && hist.length >= 2) {
+        for (int i = 1; i < hist.length; i++) {
+          final p0 = _mapRect(hist[i - 1]).center;
+          final p1 = _mapRect(hist[i]).center;
+          final double tFade = (i / hist.length) * fade;
+          if (tFade <= 0) continue;
+          final paint = Paint()
+            ..color = c.withOpacity(0.6 * tFade)
+            ..strokeWidth = 1.4
+            ..strokeCap = StrokeCap.round;
+          canvas.drawLine(p0, p1, paint);
+          // Dot ở đầu
+          canvas.drawCircle(p1, 1.6, Paint()..color = c.withOpacity(tFade));
+        }
+      }
+      // ----- 2. Bounding box (Tesla-style: 4 corner brackets) -----
+      final boxPaint = Paint()
+        ..color = c.withOpacity(fade)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.6;
-      canvas.drawRect(mapped, paint);
-      // Label background
+        ..strokeWidth = 2.0
+        ..strokeCap = StrokeCap.square;
+      // Vẽ 4 góc (bracket style như xe Tesla)
+      final double cornerLen = math.min(14.0, math.min(mapped.width, mapped.height) / 3);
+      // Top-left
+      canvas.drawLine(mapped.topLeft, mapped.topLeft.translate(cornerLen, 0), boxPaint);
+      canvas.drawLine(mapped.topLeft, mapped.topLeft.translate(0, cornerLen), boxPaint);
+      // Top-right
+      canvas.drawLine(mapped.topRight, mapped.topRight.translate(-cornerLen, 0), boxPaint);
+      canvas.drawLine(mapped.topRight, mapped.topRight.translate(0, cornerLen), boxPaint);
+      // Bottom-left
+      canvas.drawLine(mapped.bottomLeft, mapped.bottomLeft.translate(cornerLen, 0), boxPaint);
+      canvas.drawLine(mapped.bottomLeft, mapped.bottomLeft.translate(0, -cornerLen), boxPaint);
+      // Bottom-right
+      canvas.drawLine(mapped.bottomRight, mapped.bottomRight.translate(-cornerLen, 0), boxPaint);
+      canvas.drawLine(mapped.bottomRight, mapped.bottomRight.translate(0, -cornerLen), boxPaint);
+      // ----- 3. Label background + text -----
+      final labelText = d.trackId != null
+          ? '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}% #${d.trackId}'
+          : '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}%';
       final tp = TextPainter(
         text: TextSpan(
-          text: '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}%',
-          style: TextStyle(
-              color: Colors.black, fontSize: 9, fontWeight: FontWeight.bold),
+          text: labelText,
+          style: const TextStyle(
+            color: Colors.black,
+            fontSize: 9,
+            fontWeight: FontWeight.bold,
+            fontFamily: 'monospace',
+          ),
         ),
         textDirection: TextDirection.ltr,
       )..layout();
       final labelBg = Rect.fromLTWH(
         mapped.left,
-        (mapped.top - tp.height - 2).clamp(0.0, size.height - tp.height),
-        tp.width + 4,
+        (mapped.top - tp.height - 4).clamp(0.0, size.height - tp.height),
+        tp.width + 6,
         tp.height + 2,
       );
-      canvas.drawRect(labelBg, Paint()..color = c);
-      tp.paint(canvas, Offset(labelBg.left + 2, labelBg.top + 1));
+      canvas.drawRect(labelBg, Paint()..color = c.withOpacity(fade));
+      tp.paint(canvas, Offset(labelBg.left + 3, labelBg.top + 1));
+      // ----- 4. Status badge (OK = filled dot, TENT = outlined) -----
+      final badgeCenter = Offset(mapped.right - 4, mapped.top + 4);
+      final badgePaint = Paint()
+        ..color = c.withOpacity(fade)
+        ..style = PaintingStyle.fill;
+      canvas.drawCircle(badgeCenter, 2.5, badgePaint);
     }
   }
 

@@ -1,7 +1,7 @@
 name: ghost_radar
-description: "👻 Ghost Radar - Phân tích tín hiệu âm thanh hạ tần 0.5-20 Hz trên Android"
+description: "👻 Ghost Radar v1.5.0 - Tesla-style YOLOv8n 80-class detection + NMS + tracking + low-freq audio"
 publish_to: "none"
-version: 1.0.0+1
+version: 1.5.0+5
 
 environment:
   sdk: ">=3.9.0 <4.0.0"
@@ -16,11 +16,12 @@ dependencies:
   permission_handler: ^11.3.1
   # La bàn (accelerometer + magnetometer → heading)
   sensors_plus: ^6.1.1
-  # Camera (dùng làm "IR âm bản" giả lập)
+  # Camera (dùng làm input cho YOLOv8)
   camera: ^0.12.0
-  # ML Kit Object Detection (Tesla-style real-time)
-  google_mlkit_object_detection: ^0.13.0
-  google_mlkit_commons: ^0.8.0
+  # YOLOv8n TFLite inference (Tesla-style real-time 80-class COCO)
+  tflite_flutter: ^0.11.0
+  # Resize/convert image bytes
+  image: ^4.5.4
   # Quyền truy cập thư mục
   path_provider: ^2.1.4
 
@@ -36,3 +37,5 @@ dependency_overrides:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/yolov8n.tflite

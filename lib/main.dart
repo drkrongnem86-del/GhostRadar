@@ -45,6 +45,7 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 
 import 'native/byte_tracker.dart';
 import 'native/camera_x.dart';
+import 'native/reid_engine.dart';
 import 'native/yuv_processor.dart';
 
 void main() {
@@ -595,6 +596,7 @@ class _DetectedObj {
     required this.detectedAt,
     this.trackId,
     this.trackHistory,
+    this.reidentified = false,
   });
   final String label;
   final double confidence;
@@ -602,6 +604,7 @@ class _DetectedObj {
   final DateTime detectedAt;
   final int? trackId;
   final List<Rect>? trackHistory;
+  final bool reidentified;
 
   double get ageSeconds =>
       DateTime.now().difference(detectedAt).inMilliseconds / 1000.0;
@@ -666,11 +669,14 @@ class _RadarScreenState extends State<RadarScreen>
   StreamSubscription<AccelerometerEvent>? _accelSub;
   StreamSubscription<MagnetometerEvent>? _magSub;
 
-  // ====== Camera (CameraX native v2.0+) + YOLOv8n TFLite (GPU) + ByteTrack =====
+  // ====== Camera (CameraX native v2.0+) + YOLOv8n TFLite (GPU) + ByteTrack + ReID =====
   GhostRadarCamera? _ghostCamera;
   int? _cameraTextureId;
   YuvPreprocessor? _yuvProc;
   final ByteTracker _byteTracker = ByteTracker();
+  ReIdEngine? _reid;
+  PersonFeatureExtractor? _featureExtractor;
+  int _reidMatched = 0; // counter for UI
   StreamSubscription<CameraFrame>? _frameSub;
   String _cameraError = '';
   _YoloDetector? _yolo;
@@ -771,6 +777,7 @@ class _RadarScreenState extends State<RadarScreen>
     _magSub?.cancel();
     _frameSub?.cancel();
     _yolo?.close();
+    _reid?.close();
     _recorder?.dispose();
     _ghostCamera?.dispose();
     super.dispose();
@@ -871,7 +878,7 @@ class _RadarScreenState extends State<RadarScreen>
     }
   }
 
-  // ====== YOLOv8n TFLite Object Detector ======
+  // ====== YOLOv8n TFLite Object Detector + Re-ID (v2.0.1) ======
   Future<void> _initObjectDetector() async {
     try {
       _yolo = _YoloDetector(
@@ -880,6 +887,18 @@ class _RadarScreenState extends State<RadarScreen>
         iouThreshold: 0.50,
       );
       await _yolo!.load();
+      // Re-ID: MobileNetV2 feature extractor
+      _reid = ReIdEngine();
+      try {
+        await _reid!.load();
+        _featureExtractor = PersonFeatureExtractor(_reid!);
+        // ignore: avoid_print
+        print('Re-ID ready (feature dim ${_reid!.featDim})');
+      } catch (e) {
+        // ignore: avoid_print
+        print('Re-ID disabled (load failed): $e');
+        _reid = null;
+      }
     } catch (e) {
       if (mounted) {
         setState(() => _cameraError = 'YOLO load fail: $e');
@@ -941,6 +960,59 @@ class _RadarScreenState extends State<RadarScreen>
               ))
           .toList();
       final confirmed = _byteTracker.update(btDets);
+      // 4b. Re-ID: extract features for confirmed person tracks
+      if (_reid != null && _featureExtractor != null) {
+        for (final t in confirmed) {
+          if (!t.isConfirmed) continue;
+          if (t.className != 'person') continue;
+          if (t.feature != null) continue; // already have feature
+          if (t.hits % 5 != 0) continue; // extract every 5 frames
+          final feat = _featureExtractor!.extract(
+            frame,
+            t.lastBbox.x1,
+            t.lastBbox.y1,
+            t.lastBbox.x2,
+            t.lastBbox.y2,
+          );
+          if (feat != null) {
+            t.feature = feat;
+          }
+        }
+        // 4c. For newly-created tracks (age 0, hits 1), try to match with gallery
+        for (final t in confirmed) {
+          if (t.age > 0) continue; // not a new track
+          if (t.className != 'person') continue;
+          // Re-ID: try match with gallery
+          if (t.feature == null) {
+            final feat = _featureExtractor!.extract(
+              frame,
+              t.lastBbox.x1,
+              t.lastBbox.y1,
+              t.lastBbox.x2,
+              t.lastBbox.y2,
+            );
+            if (feat != null) {
+              t.feature = feat;
+              final matchId = _reid!.findMatch(feat, t.className);
+              if (matchId != null) {
+                t.reidentified = true;
+                t.originalId = t.id;
+                t.id = matchId; // re-assign original ID
+                _reidMatched++;
+                // ignore: avoid_print
+                print('Re-ID matched: new track -> ID $matchId');
+              }
+            }
+          }
+        }
+        // 4d. Save to gallery for tracks that have been missed for a while
+        for (final t in confirmed) {
+          if (t.isConfirmed && t.feature != null && t.timeSinceUpdate >= 3) {
+            // Track is about to be lost - save feature to gallery
+            _reid!.addToGallery(t, t.feature);
+          }
+        }
+      }
       // 5. Map to UI
       _onTracksReady(confirmed, Size(frame.width.toDouble(), frame.height.toDouble()));
     } catch (e) {
@@ -971,6 +1043,7 @@ class _RadarScreenState extends State<RadarScreen>
         boundingBox: t.lastBbox.toRect(),
         detectedAt: now,
         trackId: t.id,
+        reidentified: t.reidentified,
       ));
     }
     if (_detections.length > 60) {
@@ -1845,7 +1918,7 @@ class _RadarScreenState extends State<RadarScreen>
           ),
           if (_isScanning)
             Text(
-              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · CameraX: ${_cameraTextureId != null ? "ON" : "OFF"}',
+              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · CameraX: ${_cameraTextureId != null ? "ON" : "OFF"} · ReID: $_reidMatched re-identified',
               style: const TextStyle(fontSize: 11, color: Color(0xFFB0B0B0)),
             ),
         ],
@@ -2421,9 +2494,10 @@ class _DetectionPainter extends CustomPainter {
       canvas.drawLine(mapped.bottomRight, mapped.bottomRight.translate(-cornerLen, 0), boxPaint);
       canvas.drawLine(mapped.bottomRight, mapped.bottomRight.translate(0, -cornerLen), boxPaint);
       // ----- 3. Label background + text -----
+      final reidBadge = d.reidentified ? ' (re-id)' : '';
       final labelText = d.trackId != null
-          ? '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}% #${d.trackId}'
-          : '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}%';
+          ? '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}% #${d.trackId}$reidBadge'
+          : '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}%$reidBadge';
       final tp = TextPainter(
         text: TextSpan(
           text: labelText,

@@ -12,6 +12,7 @@
 // Standard constant-velocity model.
 
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui';
 
 class BoxInternal {
@@ -255,7 +256,7 @@ class TrackedObject {
     kf.init(initialBbox);
   }
 
-  final int id;
+  int id; // mutable for Re-ID reassignment
   String className;
   final _KalmanFilter kf;
   int age; // frames since creation
@@ -264,6 +265,13 @@ class TrackedObject {
   int timeSinceUpdate; // consecutive unmatched
   BoxInternal lastBbox;
   final DateTime firstSeen;
+
+  /// Re-ID appearance feature (L2-normalized embedding).
+  /// Set when track is confirmed and feature is extracted.
+  /// Used to re-identify the same person when reappearing after occlusion.
+  Float32List? feature;
+  bool reidentified = false; // true if ID was re-assigned via Re-ID
+  int? originalId; // for re-id'd tracks, store the original (pre-re-id) ID
 
   /// Predict the next bbox (call before matching).
   BoxInternal predictNext() {

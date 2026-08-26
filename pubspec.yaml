@@ -1,7 +1,7 @@
 name: ghost_radar
 description: "👻 Ghost Radar v1.5.0 - Tesla-style YOLOv8n 80-class detection + NMS + tracking + low-freq audio"
 publish_to: "none"
-version: 2.0.0+6
+version: 2.0.1+7
 
 environment:
   sdk: ">=3.9.0 <4.0.0"
@@ -39,3 +39,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/yolov8n.tflite
+    - assets/reid_mobilenet.tflite

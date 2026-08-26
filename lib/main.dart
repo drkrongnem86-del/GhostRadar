@@ -43,6 +43,10 @@ import 'package:record/record.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
+import 'native/byte_tracker.dart';
+import 'native/camera_x.dart';
+import 'native/yuv_processor.dart';
+
 void main() {
   runApp(const GhostRadarApp());
 }
@@ -186,24 +190,55 @@ class _YoloDetector {
 
   bool get isReady => _interpreter != null;
 
+  /// Use GPU delegate for 2-3x faster inference (Samsung A17 Snapdragon 6100+)
+  bool useGpu = true;
+
   Future<void> load() async {
+    Interpreter? interpreter;
+    String mode = 'cpu';
     try {
+      if (useGpu) {
+        final gpuDelegate = GpuDelegateV2(
+          options: GpuDelegateOptionsV2(
+            isPrecisionLossAllowed: true, // float16 OK for detection
+            // 0 = FAST_SINGLE_ANSWER (best for live camera)
+            inferencePreference: 0,
+            // 0 = AUTO priority for all
+            inferencePriority1: 0,
+            inferencePriority2: 0,
+            inferencePriority3: 0,
+          ),
+        );
+        final gpuOpts = InterpreterOptions()
+          ..threads = 2
+          ..addDelegate(gpuDelegate);
+        interpreter = await Interpreter.fromAsset(
+          'yolov8n.tflite',
+          options: gpuOpts,
+        );
+        mode = 'gpu';
+        // ignore: avoid_print
+        print('YOLO loaded with GPU delegate');
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('YOLO GPU load failed, falling back to CPU: $e');
+      interpreter = null;
+    }
+    if (interpreter == null) {
       final opts = InterpreterOptions()
         ..threads = 4
-        ..useNnApiForAndroid = false; // CPU-only cho Samsung A17 ổn định
-      _interpreter = await Interpreter.fromAsset(
+        ..useNnApiForAndroid = false;
+      interpreter = await Interpreter.fromAsset(
         'yolov8n.tflite',
         options: opts,
       );
-      _inShape = _interpreter!.getInputTensor(0).shape;
-      _outShape = _interpreter!.getOutputTensor(0).shape;
-      // ignore: avoid_print
-      print('YOLO loaded in=${_inShape} out=${_outShape}');
-    } catch (e) {
-      // ignore: avoid_print
-      print('YOLO load fail: $e');
-      rethrow;
     }
+    _interpreter = interpreter;
+    _inShape = _interpreter!.getInputTensor(0).shape;
+    _outShape = _interpreter!.getOutputTensor(0).shape;
+    // ignore: avoid_print
+    print('YOLO loaded mode=$mode in=$_inShape out=$_outShape');
   }
 
   // Chuyển YUV_420_888 frame từ camera thành input float32 NCHW đã normalize.
@@ -631,15 +666,17 @@ class _RadarScreenState extends State<RadarScreen>
   StreamSubscription<AccelerometerEvent>? _accelSub;
   StreamSubscription<MagnetometerEvent>? _magSub;
 
-  // ====== Camera + YOLOv8n TFLite ======
-  CameraController? _cameraController;
-  List<CameraDescription> _cameras = <CameraDescription>[];
+  // ====== Camera (CameraX native v2.0+) + YOLOv8n TFLite (GPU) + ByteTrack =====
+  GhostRadarCamera? _ghostCamera;
+  int? _cameraTextureId;
+  YuvPreprocessor? _yuvProc;
+  final ByteTracker _byteTracker = ByteTracker();
+  StreamSubscription<CameraFrame>? _frameSub;
   String _cameraError = '';
   _YoloDetector? _yolo;
-  final _Tracker _tracker = _Tracker();
   bool _isDetecting = false;
   int _frameCounter = 0;
-  static const int _detectEveryNFrames = 5; // xử lý mỗi 5 frame
+  static const int _detectEveryNFrames = 3; // xử lý mỗi 3 frame (GPU nhanh hơn)
 
   // Confirmed tracks (giữ ~3 giây history) - dùng để render
   final List<_DetectedObj> _detections = <_DetectedObj>[];
@@ -732,20 +769,23 @@ class _RadarScreenState extends State<RadarScreen>
     _streamSub?.cancel();
     _accelSub?.cancel();
     _magSub?.cancel();
+    _frameSub?.cancel();
     _yolo?.close();
     _recorder?.dispose();
-    _cameraController?.dispose();
+    _ghostCamera?.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final c = _cameraController;
-    if (c == null || !c.value.isInitialized) return;
     if (state == AppLifecycleState.inactive) {
-      c.dispose();
+      _ghostCamera?.stopCamera();
     } else if (state == AppLifecycleState.resumed) {
-      _initCamera();
+      if (_cameraTextureId != null) {
+        _ghostCamera?.startCamera(textureId: _cameraTextureId!);
+      } else {
+        _initCamera();
+      }
     }
   }
 
@@ -804,7 +844,7 @@ class _RadarScreenState extends State<RadarScreen>
     }
   }
 
-  // ====== Camera ======
+  // ====== Camera (CameraX native v2.0+) ======
   Future<void> _initCamera() async {
     try {
       final camStatus = await Permission.camera.request();
@@ -812,37 +852,22 @@ class _RadarScreenState extends State<RadarScreen>
         if (mounted) setState(() => _cameraError = 'Không có quyền camera');
         return;
       }
-      _cameras = await availableCameras();
-      if (_cameras.isEmpty) {
-        if (mounted) setState(() => _cameraError = 'Không tìm thấy camera');
-        return;
-      }
-      CameraDescription cam = _cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.back,
-        orElse: () => _cameras.first,
-      );
-      final controller = CameraController(
-        cam,
-        ResolutionPreset.low,
-        enableAudio: false,
-      );
-      await controller.initialize();
-      if (!mounted) {
-        await controller.dispose();
-        return;
-      }
-      // Bắt đầu image stream cho ML Kit
-      try {
-        await controller.startImageStream(_processCameraImage);
-      } catch (e) {
-        // Một số thiết bị không cho start stream cùng lúc với preview
-      }
+      // Init YUV preprocessor
+      _yuvProc = YuvPreprocessor.create(inputSize: 640);
+      // Init native CameraX bridge
+      _ghostCamera = GhostRadarCamera(inputSize: 640);
+      // Create Flutter texture for preview
+      final textureId = await _ghostCamera!.createTexture();
+      _cameraTextureId = textureId;
+      // Start camera (preview + frame stream)
+      await _ghostCamera!.startCamera(textureId: textureId);
+      _frameSub = _ghostCamera!.frames.listen(_onCameraFrame);
+      if (!mounted) return;
       setState(() {
-        _cameraController = controller;
         _cameraError = '';
       });
     } catch (e) {
-      if (mounted) setState(() => _cameraError = 'Lỗi camera: $e');
+      if (mounted) setState(() => _cameraError = 'Lỗi CameraX: $e');
     }
   }
 
@@ -862,56 +887,77 @@ class _RadarScreenState extends State<RadarScreen>
     }
   }
 
-  void _processCameraImage(CameraImage image) {
+  void _onCameraFrame(CameraFrame frame) {
     if (_yolo == null || !_yolo!.isReady || _isDetecting) return;
+    if (_yuvProc == null) return;
     _frameCounter++;
     if (_frameCounter % _detectEveryNFrames != 0) return;
     _isDetecting = true;
-    _runDetection(image);
+    _runDetectionV2(frame);
   }
 
-  Future<void> _runDetection(CameraImage image) async {
+  /// v2.0 detection pipeline:
+  ///   1. Preprocess YUV -> NCHW Float32 (Dart fallback for now; native JNI hooked up)
+  ///   2. TFLite GPU inference
+  ///   3. Decode + NMS (xywh -> xyxy)
+  ///   4. ByteTrack + Kalman update
+  Future<void> _runDetectionV2(CameraFrame frame) async {
     try {
       final yolo = _yolo;
-      if (yolo == null || !yolo.isReady) {
+      final proc = _yuvProc;
+      if (yolo == null || !yolo.isReady || proc == null) {
         _isDetecting = false;
         return;
       }
-      // 1. Letterbox params (giữ aspect ratio)
-      final lb = yolo.computeLetterbox(image.width, image.height);
-      // 2. Preprocess: YUV→RGB→640x640 letterbox→normalize NCHW
-      final input = yolo.preprocessYuv(image, 0);
-      // 3. Inference
-      final raw = yolo.runInference(input);
-      // 4. Postprocess: decode + NMS
+      // 1. Preprocess (Dart-side; native JNI hooked for future use)
+      proc.preprocess(
+        yPlane: frame.y,
+        uPlane: frame.u,
+        vPlane: frame.v,
+        yRowStride: frame.yRowStride,
+        uvRowStride: frame.uvRowStride,
+        uvPixelStride: frame.uvPixelStride,
+        width: frame.width,
+        height: frame.height,
+      );
+      final lb = proc.letterbox;
+      // 2. Inference (Float32List NCHW; runInference does the reshape)
+      final raw = yolo.runInference(proc.outputBuffer);
+      // 3. Postprocess: decode + NMS
       final dets = yolo.postprocess(
         raw,
-        image.width,
-        image.height,
+        frame.width,
+        frame.height,
         letterboxPadX: lb.padX,
         letterboxPadY: lb.padY,
         letterboxScale: lb.scale,
       );
-      // 5. Tracker update → trả về active tracks
-      final now = DateTime.now();
-      final activeTracks = _tracker.update(dets, now);
-      _onDetectionsReady(activeTracks, Size(image.width.toDouble(), image.height.toDouble()));
+      // 4. ByteTrack + Kalman
+      final btDets = dets
+          .map((d) => YoloDetectionForTracker(
+                bbox: BoxInternal.fromRect(d.bbox),
+                className: d.className,
+                confidence: d.confidence,
+              ))
+          .toList();
+      final confirmed = _byteTracker.update(btDets);
+      // 5. Map to UI
+      _onTracksReady(confirmed, Size(frame.width.toDouble(), frame.height.toDouble()));
     } catch (e) {
-      // ignore
+      // ignore: avoid_print
+      print('Detection error: $e');
     } finally {
       _isDetecting = false;
     }
   }
 
-  void _onDetectionsReady(List<_Track> tracks, Size imageSize) {
+  void _onTracksReady(List<TrackedObject> tracks, Size imageSize) {
     if (!mounted) return;
     final now = DateTime.now();
-    // Cập nhật danh sách detection (giữ 3s)
     _detections.removeWhere((d) => d.ageSeconds > _detectionLifetimeSec);
     final counts = <String, int>{};
     String topLabel = '--';
     double topConf = 0;
-    // Chỉ render tracks confirmed (đã thấy ≥3 frame) - persistence filter
     for (final t in tracks) {
       if (!t.isConfirmed) continue;
       counts[t.className] = (counts[t.className] ?? 0) + 1;
@@ -922,13 +968,11 @@ class _RadarScreenState extends State<RadarScreen>
       _detections.add(_DetectedObj(
         label: t.className,
         confidence: t.confidence,
-        boundingBox: t.bbox,
+        boundingBox: t.lastBbox.toRect(),
         detectedAt: now,
         trackId: t.id,
-        trackHistory: List<Rect>.from(t.history),
       ));
     }
-    // Cap detections list
     if (_detections.length > 60) {
       _detections.removeRange(0, _detections.length - 60);
     }
@@ -1585,7 +1629,6 @@ class _RadarScreenState extends State<RadarScreen>
   }
 
   Widget _cameraContent() {
-    final ctrl = _cameraController;
     if (_cameraError.isNotEmpty) {
       return Container(
         color: const Color(0xFF0A0A0A),
@@ -1602,7 +1645,7 @@ class _RadarScreenState extends State<RadarScreen>
         ),
       );
     }
-    if (ctrl == null || !ctrl.value.isInitialized) {
+    if (_cameraTextureId == null) {
       return Container(
         color: const Color(0xFF0A0A0A),
         child: const Center(
@@ -1619,7 +1662,7 @@ class _RadarScreenState extends State<RadarScreen>
                 ),
               ),
               SizedBox(height: 6),
-              Text('Đang mở camera…',
+              Text('Đang mở CameraX…',
                   style:
                       TextStyle(fontSize: 10, color: Color(0xFF808080))),
             ],
@@ -1627,11 +1670,12 @@ class _RadarScreenState extends State<RadarScreen>
         ),
       );
     }
+    // Render Flutter texture bound to CameraX SurfaceTexture
     return FittedBox(
       fit: BoxFit.cover,
       child: SizedBox(
-        width: ctrl.value.previewSize?.height ?? 240,
-        height: ctrl.value.previewSize?.width ?? 240,
+        width: 480, // CameraX target resolution (see CameraService.kt)
+        height: 640,
         child: ColorFiltered(
           colorFilter: const ColorFilter.matrix(<double>[
             -1, 0, 0, 0, 255, //
@@ -1639,7 +1683,7 @@ class _RadarScreenState extends State<RadarScreen>
             0, 0, -1, 0, 255, //
             0, 0, 0, 1, 0, //
           ]),
-          child: CameraPreview(ctrl),
+          child: Texture(textureId: _cameraTextureId!),
         ),
       ),
     );
@@ -1649,31 +1693,22 @@ class _RadarScreenState extends State<RadarScreen>
     if (_detections.isEmpty) return const SizedBox.shrink();
     return LayoutBuilder(
       builder: (context, constraints) {
-        // CameraPreview dùng FittedBox.cover với SizedBox(previewSize).
-        // Tính scale + offset để map image coords sang display coords.
+        // CameraX v2.0: image size is fixed 480x640 (sensor landscape).
+        // FittedBox.cover fills display while preserving aspect.
         final Size box = Size(constraints.maxWidth, constraints.maxHeight);
-        Size imgSize;
-        try {
-          final ps = _cameraController?.value.previewSize;
-          if (ps == null) {
-            imgSize = const Size(240, 320);
-          } else {
-            // previewSize = (w, h) ở sensor orientation
-            // CameraPreview widget thường xoay, ta dùng max(w,h) x min(w,h) cho display
-            imgSize = Size(math.max(ps.width, ps.height),
-                math.max(ps.width, ps.height) * (box.height / box.width));
-          }
-        } catch (_) {
-          imgSize = const Size(240, 320);
-        }
-        final double scale =
-            math.max(box.width / imgSize.width, box.height / imgSize.height);
-        final double dx = (box.width - imgSize.width * scale) / 2.0;
-        final double dy = (box.height - imgSize.height * scale) / 2.0;
+        // Image is rendered via Texture with SizedBox(480x640) then FittedBox.cover
+        // BoxFit.cover: scale = max(box.w/img.w, box.h/img.h)
+        const double imgW = 640;
+        const double imgH = 480;
+        final double scale = math.max(box.width / imgW, box.height / imgH);
+        final double scaledW = imgW * scale;
+        final double scaledH = imgH * scale;
+        final double dx = (box.width - scaledW) / 2.0;
+        final double dy = (box.height - scaledH) / 2.0;
         return CustomPaint(
           painter: _DetectionPainter(
             detections: _detections,
-            imgSize: imgSize,
+            imgSize: const Size(imgW, imgH),
             scale: scale,
             dx: dx,
             dy: dy,
@@ -1810,7 +1845,7 @@ class _RadarScreenState extends State<RadarScreen>
           ),
           if (_isScanning)
             Text(
-              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · Camera ML: ${_cameraController?.value.isInitialized == true ? "ON" : "OFF"}',
+              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · CameraX: ${_cameraTextureId != null ? "ON" : "OFF"}',
               style: const TextStyle(fontSize: 11, color: Color(0xFFB0B0B0)),
             ),
         ],

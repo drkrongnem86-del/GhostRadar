@@ -51,7 +51,7 @@ android {
 
     buildTypes {
         release {
-            // Debug ký tạm để test; muốn release thật cần keystore
+            // Debug ky tam de test; muon release that can keystore
             signingConfig = signingConfigs.debug
             minifyEnabled = false
             shrinkResources = false
@@ -61,4 +61,17 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // CameraX (Android native camera - v2.0+)
+    def cameraxVersion = "1.5.3"
+    implementation "androidx.camera:camera-core:$cameraxVersion"
+    implementation "androidx.camera:camera-camera2:$cameraxVersion"
+    implementation "androidx.camera:camera-lifecycle:$cameraxVersion"
+    implementation "androidx.camera:camera-view:$cameraxVersion"
+    // Guava for ListenableFuture (CameraX uses it)
+    implementation 'com.google.guava:guava:32.0.1-android'
+    // Kotlin coroutines
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
 }

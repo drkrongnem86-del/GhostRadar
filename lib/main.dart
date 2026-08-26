@@ -1,11 +1,17 @@
-// Ghost Radar v2.0.2 - "Tesla-style" multi-modal ghost detection
+// Ghost Radar v2.1.0 - "Tesla-style" multi-modal ghost detection
 //
-// v2.0.2 changes vs v2.0.1:
+// v2.1.0 changes vs v2.0.2 - "Researcher Upgrade" (3 domains):
+//   1. Waterfall Spectrogram (Sonic Visualiser / Praat style)
+//      Real-time scrolling FFT heatmap, viridis colormap, 0-50Hz range
+//   2. EVP auto-capture + Magnetometer EMF meter (GhostTube / SB7 style)
+//      On ghost combo: save 10s WAV clip. EMF bar shows magnetometer field
+//   3. On-device YOLO dataset export (CVAT / VIA style)
+//      Save current frame + bboxes as YOLO format, zip + share
+//
+// v2.0.2 changes (kept):
 //   - DetectionLogger: JSONL log file cho clinical review
-//     (combo + audio alarm + per-track detection, throttled 8s/track)
 //   - UI: nút Xem log / Chia sẻ log / Xóa log + event counter
 //   - Foreground Service (Kotlin) giữ camera + mic khi screen off
-//     persistent notification "Ghost Radar đang quét 0-20Hz + YOLOv8"
 //
 // Audio pipeline (low-freq 0-20Hz):
 //   PCM 44.1kHz → 4-stage IIR anti-alias (25Hz)
@@ -55,7 +61,12 @@ import 'native/camera_x.dart';
 import 'native/reid_engine.dart';
 import 'native/yuv_processor.dart';
 import 'detection_logger.dart';
+import 'waterfall_spectrogram.dart';
+import 'emf_meter.dart';
+import 'evp_recorder.dart';
+import 'dataset_exporter.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:image/image.dart' as img;
 
 void main() {
   runApp(const GhostRadarApp());
@@ -722,6 +733,15 @@ class _RadarScreenState extends State<RadarScreen>
   final Map<int, DateTime> _lastDetectionLog = <int, DateTime>{};
   int _loggedDetectionCount = 0;
 
+  // ====== v2.1.0 Researcher Upgrade ======
+  // Keys to control child widgets from this state (call pushFrame, push, etc.)
+  final GlobalKey<State<WaterfallSpectrogram>> _waterfallKey =
+      GlobalKey<State<WaterfallSpectrogram>>();
+  final GlobalKey<State<EmfMeter>> _emfKey = GlobalKey<State<EmfMeter>>();
+  EvpRecorder? _evpRecorder;
+  int _evpCount = 0;
+  int _datasetCount = 0;
+
   // ====== UI state ======
   bool _isScanning = false;
   String _statusText = 'CHƯA KHỞI ĐỘNG';
@@ -766,6 +786,12 @@ class _RadarScreenState extends State<RadarScreen>
     _startSensors();
     _initCamera();
     _initObjectDetector();
+
+    // v2.1.0: load existing dataset count on app start
+    DatasetExporter.getSampleCount().then((n) {
+      if (mounted) setState(() => _datasetCount = n);
+    });
+    DatasetExporter.writeClassesTxt();
   }
 
   void _onTick(Duration elapsed) {
@@ -869,6 +895,10 @@ class _RadarScreenState extends State<RadarScreen>
         _hasCompass = true;
       });
     }
+
+    // v2.1.0: push raw magnetometer reading to EMF meter (raw µT)
+    // sensors_plus returns magnetometer in microtesla already
+    (_emfKey.currentState as dynamic)?.push(_mx, _my, _mz);
   }
 
   // ====== Camera (CameraX native v2.0+) ======
@@ -1126,9 +1156,45 @@ class _RadarScreenState extends State<RadarScreen>
           trackId: top.trackId ?? -1,
           headingDeg: _heading,
         );
+        // v2.1.0: auto-capture EVP snapshot (10s WAV) on ghost combo
+        _captureEvpSnapshot(
+          className: top.label,
+          confidence: top.confidence,
+          trackId: top.trackId,
+          headingDeg: _heading,
+        );
       }
     }
     _ghostCombo = newCombo;
+  }
+
+  /// v2.1.0: Save current 10s EVP rolling buffer to a WAV file.
+  Future<void> _captureEvpSnapshot({
+    required String className,
+    required double confidence,
+    required int? trackId,
+    required double headingDeg,
+  }) async {
+    final evp = _evpRecorder;
+    if (evp == null || !evp.hasFullBuffer) return;
+    try {
+      final path = await evp.saveCurrentSnapshot(
+        heading: headingDeg,
+        className: className,
+        confidence: confidence,
+        trackId: trackId,
+      );
+      if (mounted) {
+        setState(() {
+          _evpCount++;
+        });
+      }
+      // ignore: avoid_print
+      print('EVP saved: $path');
+    } catch (e) {
+      // ignore: avoid_print
+      print('EVP save failed: $e');
+    }
   }
 
   // ====== Compass helpers ======
@@ -1229,6 +1295,11 @@ class _RadarScreenState extends State<RadarScreen>
     // v2.0.2: Promote to Foreground Service so Android keeps us alive
     // when the screen turns off during a long clinical review session.
     unawaited(_startForegroundService());
+
+    // v2.1.0: Init EVP rolling recorder (10s @ 100Hz = 1000 samples)
+    _evpRecorder = EvpRecorder(lookbackSec: 10, sampleRate: 100);
+    // Clear waterfall history on new scan
+    (_waterfallKey.currentState as dynamic)?.clear?.call();
   }
 
   Future<void> stopScan() async {
@@ -1255,6 +1326,10 @@ class _RadarScreenState extends State<RadarScreen>
 
     // v2.0.2: Stop foreground service
     unawaited(_stopForegroundService());
+
+    // v2.1.0: Release EVP recorder
+    _evpRecorder?.dispose();
+    _evpRecorder = null;
   }
 
   void toggleMute() => setState(() => _alarmMuted = !_alarmMuted);
@@ -1321,6 +1396,9 @@ class _RadarScreenState extends State<RadarScreen>
           _lrFilled++;
           if (_lrFilled == _fftSize) _bufferReady = true;
         }
+        // v2.1.0: push to EVP rolling buffer (only the 100Hz decimated output,
+        // so EVP WAV = 100Hz mono 16-bit, same as our spectrogram data)
+        _evpRecorder?.pushSample(y4);
       }
     }
   }
@@ -1393,12 +1471,15 @@ class _RadarScreenState extends State<RadarScreen>
 
     final int nyquistBin = _fftSize >> 1;
     final List<double> mag2 = List<double>.filled(5, 0);
+    // v2.1.0: also collect per-bin magnitude for waterfall spectrogram
+    final List<double> magPerBin = List<double>.filled(nyquistBin, 0);
     int peakBin = -1;
     double peakVal = 0;
     for (int b = 1; b < nyquistBin; b++) {
       final double re = _fftRe[b];
       final double im = _fftIm[b];
       final double m2 = re * re + im * im;
+      magPerBin[b] = m2; // store raw magnitude squared for waterfall
       for (int band = 0; band < 5; band++) {
         if (_bandBins[band].contains(b)) {
           mag2[band] += m2;
@@ -1489,6 +1570,12 @@ class _RadarScreenState extends State<RadarScreen>
       _triggerAlarm(bestBand, bestHz, bestRatio);
     } else if (_isAlarming) {
       _stopAlarm();
+    }
+
+    // v2.1.0: push FFT magnitude frame to waterfall spectrogram
+    // (skip first few frames during baseline warmup to avoid noise)
+    if (_baselineWarmupLeft < 25) {
+      (_waterfallKey.currentState as dynamic)?.pushFrame(magPerBin);
     }
   }
 
@@ -1585,6 +1672,8 @@ class _RadarScreenState extends State<RadarScreen>
               _buttons(),
               const SizedBox(height: 6),
               _logButtons(),
+              const SizedBox(height: 6),
+              _datasetButtons(),
             ],
           ),
         ),
@@ -2031,7 +2120,8 @@ class _RadarScreenState extends State<RadarScreen>
           ),
           if (_isScanning)
             Text(
-              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · CameraX: ${_cameraTextureId != null ? "ON" : "OFF"} · ReID: $_reidMatched re-identified',
+              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · '
+              'EVP clips: $_evpCount · Dataset: $_datasetCount samples',
               style: const TextStyle(fontSize: 11, color: Color(0xFFB0B0B0)),
             ),
         ],
@@ -2040,6 +2130,7 @@ class _RadarScreenState extends State<RadarScreen>
   }
 
   Widget _bandChart() {
+    // v2.1.0: combine waterfall spectrogram + 5-band bars + EMF meter
     double maxE = 0;
     for (final e in _bandEnergy) {
       if (e > maxE) maxE = e;
@@ -2055,14 +2146,33 @@ class _RadarScreenState extends State<RadarScreen>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Padding(
-            padding: EdgeInsets.only(left: 4, bottom: 6),
-            child: Text('NĂNG LƯỢNG 5 DẢI TẦN (0–20 Hz)',
-                style: TextStyle(
-                    fontSize: 12,
-                    color: Color(0xFFB0B0B0),
-                    fontWeight: FontWeight.bold)),
+          // Title row + EMF meter
+          Row(
+            children: [
+              const Expanded(
+                child: Text('WATERFALL + 5 DẢI TẦN (0–20 Hz)',
+                    style: TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFFB0B0B0),
+                        fontWeight: FontWeight.bold)),
+              ),
+              EmfMeter(
+                key: _emfKey,
+                height: 80,
+                width: 55,
+              ),
+            ],
           ),
+          const SizedBox(height: 6),
+          // Waterfall spectrogram (v2.1.0)
+          WaterfallSpectrogram(
+            key: _waterfallKey,
+            numBins: _fftSize ~/ 2, // 128 bins (Nyquist)
+            maxFrames: 30, // ~77s history
+            height: 120,
+          ),
+          const SizedBox(height: 8),
+          // 5 band bars
           for (int i = 0; i < 5; i++) _bandBar(i, maxE),
         ],
       ),
@@ -2454,6 +2564,214 @@ class _RadarScreenState extends State<RadarScreen>
             onPressed: _clearLog,
             icon: const Icon(Icons.delete_outline, size: 18),
             label: const Text('XÓA LOG'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF263238),
+              foregroundColor: const Color(0xFFFF5252),
+              padding: const EdgeInsets.symmetric(vertical: 9),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ====== Dataset export (v2.1.0) ======
+
+  Future<void> _exportDataset() async {
+    final count = await DatasetExporter.getSampleCount();
+    if (count == 0) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Dataset trống. Bấm "LƯU FRAME" khi có detection.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+    try {
+      final size = await DatasetExporter.exportAndShare();
+      if (size == null) return;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Đã xuất $count samples (${(size / 1024).toStringAsFixed(0)} KB)'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Xuất lỗi: $e')),
+      );
+    }
+  }
+
+  Future<void> _saveCurrentFrame() async {
+    // v2.1.0: save current detection snapshot as YOLO sample.
+    // v2.1.0 limitation: native frame-grab MethodChannel deferred to v2.1.1;
+    // for now we render a label image with detection summary as the JPEG.
+    if (!_isScanning) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Cần BẮT ĐẦU quét trước')),
+      );
+      return;
+    }
+    if (_detections.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Chưa có detection nào để lưu')),
+      );
+      return;
+    }
+    try {
+      final jpegBytes = _buildLabelImage();
+      final bboxes = _detections
+          .map((d) => ImageBBox(
+                className: d.label,
+                cx: (d.boundingBox.left + d.boundingBox.right) / 2,
+                cy: (d.boundingBox.top + d.boundingBox.bottom) / 2,
+                w: d.boundingBox.width,
+                h: d.boundingBox.height,
+              ))
+          .toList();
+      final base = await DatasetExporter.saveSample(
+        jpegBytes: jpegBytes,
+        imageWidth: 640,
+        imageHeight: 480,
+        bboxes: bboxes,
+      );
+      await DatasetExporter.writeClassesTxt();
+      if (!mounted) return;
+      setState(() {
+        _datasetCount++;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Đã lưu $base (${bboxes.length} boxes)'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Lưu lỗi: $e')),
+      );
+    }
+  }
+
+  /// Build a 640x480 label image with detection summary + bbox overlays.
+  /// v2.1.0: synthesized placeholder until native frame-grab lands in v2.1.1.
+  Uint8List _buildLabelImage() {
+    final image = img.Image(width: 640, height: 480);
+    // Dark background
+    img.fill(image, color: img.ColorRgb8(8, 8, 12));
+    // Border
+    img.drawRect(image,
+        x1: 0, y1: 0, x2: 639, y2: 479,
+        color: img.ColorRgb8(40, 40, 40),
+        thickness: 2);
+    // Title
+    img.drawString(image, 'Ghost Radar v2.1.0 - YOLO sample',
+        font: img.arial24,
+        x: 12, y: 8,
+        color: img.ColorRgb8(31, 224, 51));
+    img.drawString(image, 'Detections: ${_detections.length}',
+        font: img.arial14,
+        x: 12, y: 38,
+        color: img.ColorRgb8(255, 255, 255));
+    final summary = _detections.take(3).map((d) =>
+        '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}%').join(' | ');
+    img.drawString(image, summary,
+        font: img.arial14,
+        x: 12, y: 58,
+        color: img.ColorRgb8(0, 229, 255));
+    img.drawString(image,
+        'Heading: ${_heading.toStringAsFixed(0)} deg  |  Combo: $_comboCount  |  EVP: $_evpCount',
+        font: img.arial14,
+        x: 12, y: 78,
+        color: img.ColorRgb8(176, 176, 176));
+    // Draw bboxes scaled to 640x480
+    for (final d in _detections) {
+      final double x1 = d.boundingBox.left.clamp(0, 639).toDouble();
+      final double y1 = d.boundingBox.top.clamp(0, 479).toDouble();
+      final double x2 = d.boundingBox.right.clamp(0, 639).toDouble();
+      final double y2 = d.boundingBox.bottom.clamp(0, 479).toDouble();
+      final color = _cocoColors[d.label] ?? const Color(0xFF1FE033);
+      img.drawRect(image,
+          x1: x1.toInt(),
+          y1: y1.toInt(),
+          x2: x2.toInt(),
+          y2: y2.toInt(),
+          color: img.ColorRgb8(color.red, color.green, color.blue),
+          thickness: 2);
+      img.drawString(image,
+          '${d.label} ${(d.confidence * 100).toStringAsFixed(0)}%',
+          font: img.arial14,
+          x: x1.toInt().clamp(0, 500),
+          y: (y1.toInt() - 18).clamp(0, 460),
+          color: img.ColorRgb8(color.red, color.green, color.blue));
+    }
+    // Footer
+    img.drawString(image,
+        'YOLO format: <class_id> <cx> <cy> <w> <h> (normalized 0..1)',
+        font: img.arial14,
+        x: 12, y: 450,
+        color: img.ColorRgb8(120, 120, 120));
+    return Uint8List.fromList(img.encodeJpg(image, quality: 88));
+  }
+
+  Widget _datasetButtons() {
+    return Row(
+      children: [
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: _saveCurrentFrame,
+            icon: const Icon(Icons.save_alt, size: 18),
+            label: Text('LƯU FRAME (${_datasetCount})'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF263238),
+              foregroundColor: const Color(0xFF76FF03),
+              padding: const EdgeInsets.symmetric(vertical: 9),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: _exportDataset,
+            icon: const Icon(Icons.archive, size: 18),
+            label: const Text('XUẤT DATASET'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF263238),
+              foregroundColor: const Color(0xFF40C4FF),
+              padding: const EdgeInsets.symmetric(vertical: 9),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: () async {
+              await DatasetExporter.clearAll();
+              if (!mounted) return;
+              setState(() {
+                _datasetCount = 0;
+              });
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Đã xóa dataset')),
+              );
+            },
+            icon: const Icon(Icons.delete_sweep, size: 18),
+            label: const Text('XÓA DS'),
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF263238),
               foregroundColor: const Color(0xFFFF5252),

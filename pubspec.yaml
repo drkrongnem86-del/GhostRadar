@@ -1,7 +1,7 @@
 name: ghost_radar
-description: "👻 Ghost Radar v2.0.2 - Tesla-style YOLOv8n 80-class detection + ByteTrack + Re-ID + Detection Logger + Foreground Service"
+description: "👻 Ghost Radar v2.1.0 - Tesla-style YOLOv8n + Waterfall Spectrogram + EVP auto-capture + EMF meter + YOLO dataset export"
 publish_to: "none"
-version: 2.0.2+8
+version: 2.1.0+9
 
 environment:
   sdk: ">=3.9.0 <4.0.0"
@@ -26,6 +26,8 @@ dependencies:
   path_provider: ^2.1.4
   # Chia sẻ file log qua Android share sheet
   share_plus: ^10.1.4
+  # Zip dataset YOLO để xuất (phải ^4.0.2 vì image ^4.5.4 yêu cầu)
+  archive: ^4.0.2
 
 dev_dependencies:
   flutter_test:

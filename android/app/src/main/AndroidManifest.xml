@@ -6,6 +6,12 @@
         android:maxSdkVersion="28"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32"/>
+    <!-- v2.0.2: Foreground Service để chạy nền khi screen off -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <!-- Android 13+ yêu cầu runtime permission cho notification -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
     <application
         android:label="Ghost Radar"
@@ -28,6 +34,12 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- v2.0.2: Foreground Service cho camera + microphone -->
+        <service
+            android:name=".GhostRadarService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

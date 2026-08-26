@@ -1,4 +1,11 @@
-// Ghost Radar v1.5.0 - "Tesla-style" multi-modal ghost detection
+// Ghost Radar v2.0.2 - "Tesla-style" multi-modal ghost detection
+//
+// v2.0.2 changes vs v2.0.1:
+//   - DetectionLogger: JSONL log file cho clinical review
+//     (combo + audio alarm + per-track detection, throttled 8s/track)
+//   - UI: nút Xem log / Chia sẻ log / Xóa log + event counter
+//   - Foreground Service (Kotlin) giữ camera + mic khi screen off
+//     persistent notification "Ghost Radar đang quét 0-20Hz + YOLOv8"
 //
 // Audio pipeline (low-freq 0-20Hz):
 //   PCM 44.1kHz → 4-stage IIR anti-alias (25Hz)
@@ -47,6 +54,8 @@ import 'native/byte_tracker.dart';
 import 'native/camera_x.dart';
 import 'native/reid_engine.dart';
 import 'native/yuv_processor.dart';
+import 'detection_logger.dart';
+import 'package:share_plus/share_plus.dart';
 
 void main() {
   runApp(const GhostRadarApp());
@@ -707,6 +716,12 @@ class _RadarScreenState extends State<RadarScreen>
   Timer? _alarmHapticTimer;
   bool _ghostCombo = false; // audio + visual cùng alarm
 
+  // ====== Logging throttle (v2.0.2) ======
+  // Track per-id last-log time to avoid flooding JSONL with every frame
+  static const Duration _detectionLogInterval = Duration(seconds: 8);
+  final Map<int, DateTime> _lastDetectionLog = <int, DateTime>{};
+  int _loggedDetectionCount = 0;
+
   // ====== UI state ======
   bool _isScanning = false;
   String _statusText = 'CHƯA KHỞI ĐỘNG';
@@ -724,6 +739,11 @@ class _RadarScreenState extends State<RadarScreen>
   StreamSubscription<Uint8List>? _streamSub;
   Timer? _analysisTimer;
   late final Ticker _ticker;
+
+  // ====== Foreground Service bridge (v2.0.2) ======
+  static const MethodChannel _fgsChannel =
+      MethodChannel('ghost_radar/fgs');
+  DateTime _lastFgsUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
   static const List<String> _compassDirs = <String>[
     'B', 'BĐ', 'Đ', 'ĐN', 'N', 'NT', 'T', 'TB',
@@ -1045,7 +1065,34 @@ class _RadarScreenState extends State<RadarScreen>
         trackId: t.id,
         reidentified: t.reidentified,
       ));
+
+      // v2.0.2: log detection throttled theo track_id
+      // Tránh ghi 1 track 30 lần/giây. Chỉ log lần đầu hoặc sau _detectionLogInterval.
+      final lastLogged = _lastDetectionLog[t.id];
+      final bool isNewTrack = lastLogged == null;
+      final bool isStale =
+          lastLogged != null && now.difference(lastLogged) >= _detectionLogInterval;
+      if (isNewTrack || isStale) {
+        _lastDetectionLog[t.id] = now;
+        final bbox = t.lastBbox.toRect();
+        DetectionLogger.instance.logDetection(
+          className: t.className,
+          confidence: t.confidence,
+          bbox: <double>[
+            bbox.left,
+            bbox.top,
+            bbox.right,
+            bbox.bottom,
+          ],
+          trackId: t.id,
+          headingDeg: _heading,
+          lowfreqHz: _dominantBandHz > 0 ? _dominantBandHz : null,
+        );
+        _loggedDetectionCount++;
+      }
     }
+    // Cleanup: bỏ last-log timestamps cho tracks đã biến mất >30s
+    _lastDetectionLog.removeWhere((_, ts) => now.difference(ts) > const Duration(seconds: 30));
     if (_detections.length > 60) {
       _detections.removeRange(0, _detections.length - 60);
     }
@@ -1056,6 +1103,9 @@ class _RadarScreenState extends State<RadarScreen>
       _topLabel = topLabel;
       _topConfidence = topConf;
     });
+
+    // v2.0.2: push counts to Foreground Service notification
+    unawaited(_updateForegroundService(_detections.length));
   }
 
   void _checkGhostCombo() {
@@ -1067,6 +1117,16 @@ class _RadarScreenState extends State<RadarScreen>
       // Combo haptic mạnh hơn
       HapticFeedback.heavyImpact();
       SystemSound.play(SystemSoundType.click);
+      // Log ghost combo (v2.0.2)
+      if (_detections.isNotEmpty) {
+        final top = _detections.reduce((a, b) => a.confidence > b.confidence ? a : b);
+        DetectionLogger.instance.logGhostCombo(
+          className: top.label,
+          confidence: top.confidence,
+          trackId: top.trackId ?? -1,
+          headingDeg: _heading,
+        );
+      }
     }
     _ghostCombo = newCombo;
   }
@@ -1165,6 +1225,10 @@ class _RadarScreenState extends State<RadarScreen>
           ? 'Mic dò âm thanh hạ tần + camera dò đối tượng real-time. Cả hai cùng trigger = GHOST COMBO. Cầm thẳng đứng, xoay người chậm để dò hướng.'
           : 'Mic dò 0-20Hz + camera dò object. Không đọc được la bàn — hướng blip sẽ không chính xác.';
     });
+
+    // v2.0.2: Promote to Foreground Service so Android keeps us alive
+    // when the screen turns off during a long clinical review session.
+    unawaited(_startForegroundService());
   }
 
   Future<void> stopScan() async {
@@ -1188,9 +1252,49 @@ class _RadarScreenState extends State<RadarScreen>
       _noteText =
           'Đã dừng. Báo động: $_alarmCount lần · Blip: ${_blips.length} · Ghost combo: $_comboCount';
     });
+
+    // v2.0.2: Stop foreground service
+    unawaited(_stopForegroundService());
   }
 
   void toggleMute() => setState(() => _alarmMuted = !_alarmMuted);
+
+  // ====== Foreground Service helpers (v2.0.2) ======
+  Future<void> _startForegroundService() async {
+    // Android 13+: request POST_NOTIFICATIONS first
+    try {
+      final notifStatus = await Permission.notification.request();
+      if (!notifStatus.isGranted) {
+        // continue anyway - service can run, just no visible notification
+      }
+    } catch (_) {}
+    try {
+      await _fgsChannel.invokeMethod('startForegroundService');
+    } catch (e) {
+      // Best-effort: log but don't fail scan
+      // ignore: avoid_print
+      print('GhostRadar FGS start failed: $e');
+    }
+  }
+
+  Future<void> _stopForegroundService() async {
+    try {
+      await _fgsChannel.invokeMethod('stopForegroundService');
+    } catch (_) {}
+  }
+
+  Future<void> _updateForegroundService(int tracks) async {
+    // Throttle: chỉ update mỗi 2s để tránh spam notification
+    final now = DateTime.now();
+    if (now.difference(_lastFgsUpdate) < const Duration(seconds: 2)) return;
+    _lastFgsUpdate = now;
+    try {
+      await _fgsChannel.invokeMethod('updateForegroundService', <String, dynamic>{
+        'tracks': tracks,
+        'logs': _loggedDetectionCount,
+      });
+    } catch (_) {}
+  }
 
   // ====== Audio callback ======
   void _onAudioData(Uint8List bytes) {
@@ -1394,6 +1498,13 @@ class _RadarScreenState extends State<RadarScreen>
       _alarmCount += 1;
       _lastAlarmSummary =
           '${_bandNames[band]} · ≈ ${hz.toStringAsFixed(1)} Hz · ${ratio.toStringAsFixed(1)}× nền';
+      // v2.0.2: log first audio alarm event
+      DetectionLogger.instance.logAudioAlarm(
+        bandIndex: band,
+        hz: hz,
+        ratio: ratio,
+        headingDeg: _heading,
+      );
       _alarmHapticTimer?.cancel();
       _alarmHapticTimer = Timer.periodic(
         const Duration(milliseconds: 350),
@@ -1472,6 +1583,8 @@ class _RadarScreenState extends State<RadarScreen>
               _note(),
               const SizedBox(height: 6),
               _buttons(),
+              const SizedBox(height: 6),
+              _logButtons(),
             ],
           ),
         ),
@@ -2187,6 +2300,166 @@ class _RadarScreenState extends State<RadarScreen>
               padding: const EdgeInsets.symmetric(vertical: 11),
               textStyle: const TextStyle(
                   fontSize: 13, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ====== Log management (v2.0.2) ======
+
+  Future<void> _showLogDialog() async {
+    final lines = await DetectionLogger.instance.tailCurrentLog(50);
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF101010),
+        title: Row(
+          children: [
+            const Icon(Icons.description, color: Color(0xFF00E5FF), size: 20),
+            const SizedBox(width: 8),
+            const Text('Detection log (50 dòng cuối)',
+                style: TextStyle(color: Colors.white, fontSize: 16)),
+          ],
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 400,
+          child: lines.isEmpty
+              ? const Center(
+                  child: Text('Chưa có log nào',
+                      style: TextStyle(color: Colors.white54)),
+                )
+              : ListView.builder(
+                  itemCount: lines.length,
+                  itemBuilder: (_, i) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 1),
+                    child: SelectableText(
+                      lines[i],
+                      style: const TextStyle(
+                        color: Color(0xFFB0BEC5),
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ),
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('ĐÓNG', style: TextStyle(color: Color(0xFF00E5FF))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _shareLog() async {
+    final path = await DetectionLogger.instance.getCurrentLogPath();
+    if (path == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Chưa có log để chia sẻ'), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+    try {
+      await Share.shareXFiles(
+        [XFile(path)],
+        text: 'Ghost Radar log (${_loggedDetectionCount} detections)',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+            content: Text('Chia sẻ lỗi: $e'), duration: const Duration(seconds: 2)),
+      );
+    }
+  }
+
+  Future<void> _clearLog() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF101010),
+        title: const Text('Xóa toàn bộ log?',
+            style: TextStyle(color: Colors.white, fontSize: 16)),
+        content: const Text(
+          'Sẽ xóa tất cả file detection_log trong app. Không thể khôi phục.',
+          style: TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('HỦY', style: TextStyle(color: Colors.white54)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('XÓA', style: TextStyle(color: Color(0xFFFF3B3B))),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await DetectionLogger.instance.clearAll();
+    _lastDetectionLog.clear();
+    _loggedDetectionCount = 0;
+    if (!mounted) return;
+    setState(() {});
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Đã xóa log'), duration: Duration(seconds: 2)),
+    );
+  }
+
+  Widget _logButtons() {
+    return Row(
+      children: [
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: _showLogDialog,
+            icon: const Icon(Icons.list_alt, size: 18),
+            label: Text('XEM LOG ($_loggedDetectionCount)'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF263238),
+              foregroundColor: const Color(0xFF00E5FF),
+              padding: const EdgeInsets.symmetric(vertical: 9),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: _shareLog,
+            icon: const Icon(Icons.share, size: 18),
+            label: const Text('CHIA SẺ'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF263238),
+              foregroundColor: const Color(0xFFFFB300),
+              padding: const EdgeInsets.symmetric(vertical: 9),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: _clearLog,
+            icon: const Icon(Icons.delete_outline, size: 18),
+            label: const Text('XÓA LOG'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF263238),
+              foregroundColor: const Color(0xFFFF5252),
+              padding: const EdgeInsets.symmetric(vertical: 9),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
             ),
           ),
         ),

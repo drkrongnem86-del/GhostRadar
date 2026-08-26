@@ -89,6 +89,33 @@ class MainActivity : FlutterActivity() {
                             "scale" to p.scale.toDouble()
                         ))
                     }
+                    "startForegroundService" -> {
+                        // v2.0.2: Start GhostRadarService to keep app alive when screen off
+                        try {
+                            GhostRadarService.start(this)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("FGS_START_FAIL", e.message, null)
+                        }
+                    }
+                    "stopForegroundService" -> {
+                        try {
+                            GhostRadarService.stop(this)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("FGS_STOP_FAIL", e.message, null)
+                        }
+                    }
+                    "updateForegroundService" -> {
+                        val tracks = call.argument<Int>("tracks") ?: 0
+                        val logs = call.argument<Int>("logs") ?: 0
+                        try {
+                            GhostRadarService.update(this, tracks, logs)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("FGS_UPDATE_FAIL", e.message, null)
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }

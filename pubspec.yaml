@@ -1,7 +1,7 @@
 name: ghost_radar
-description: "👻 Ghost Radar v1.5.0 - Tesla-style YOLOv8n 80-class detection + NMS + tracking + low-freq audio"
+description: "👻 Ghost Radar v2.0.2 - Tesla-style YOLOv8n 80-class detection + ByteTrack + Re-ID + Detection Logger + Foreground Service"
 publish_to: "none"
-version: 2.0.1+7
+version: 2.0.2+8
 
 environment:
   sdk: ">=3.9.0 <4.0.0"
@@ -24,6 +24,8 @@ dependencies:
   image: ^4.5.4
   # Quyền truy cập thư mục
   path_provider: ^2.1.4
+  # Chia sẻ file log qua Android share sheet
+  share_plus: ^10.1.4
 
 dev_dependencies:
   flutter_test:

@@ -1,7 +1,7 @@
 name: ghost_radar
-description: "👻 Ghost Radar v2.1.0 - Tesla-style YOLOv8n + Waterfall Spectrogram + EVP auto-capture + EMF meter + YOLO dataset export"
+description: "👻 Ghost Radar v2.1.1 - 720p camera clarity + compact 1-page UI"
 publish_to: "none"
-version: 2.1.0+9
+version: 2.1.1+10
 
 environment:
   sdk: ">=3.9.0 <4.0.0"

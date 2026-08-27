@@ -1,6 +1,12 @@
-// Ghost Radar v2.1.0 - "Tesla-style" multi-modal ghost detection
+// Ghost Radar v2.1.1 - "Tesla-style" multi-modal ghost detection
 //
-// v2.1.0 changes vs v2.0.2 - "Researcher Upgrade" (3 domains):
+// v2.1.1 changes vs v2.1.0 - Camera clarity + UI compact 1-page:
+//   - Camera bump 640x480 -> 1280x720 (720p HD) cho preview rõ hơn
+//   - Scanlines 0.30 -> 0.12, toggleable (default OFF cho clarity)
+//   - UI: gộp detection + info + EMF, waterfall 120->70, band bars 1-row ribbon
+//   - SingleChildScrollView -> Column fit 1 page (Samsung A17 ~412x892dp)
+//
+// v2.1.0 changes (kept) - "Researcher Upgrade" (3 domains):
 //   1. Waterfall Spectrogram (Sonic Visualiser / Praat style)
 //      Real-time scrolling FFT heatmap, viridis colormap, 0-50Hz range
 //   2. EVP auto-capture + Magnetometer EMF meter (GhostTube / SB7 style)
@@ -741,6 +747,10 @@ class _RadarScreenState extends State<RadarScreen>
   EvpRecorder? _evpRecorder;
   int _evpCount = 0;
   int _datasetCount = 0;
+
+  // v2.1.1: camera UX toggles
+  bool _scanlinesOn = false; // default OFF cho clarity
+  bool _irFilterOn = false; // default OFF (Samsung A17 RGB không phải IR thật)
 
   // ====== UI state ======
   bool _isScanning = false;
@@ -1639,41 +1649,46 @@ class _RadarScreenState extends State<RadarScreen>
       ),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(10.0),
+          padding: const EdgeInsets.all(6.0),
           child: Column(
             children: [
               _alarmBanner(),
               if (_ghostCombo) _comboBanner(),
-              // ===== 2 cột: radar (trái) + camera IR + ML (phải) =====
+              // v2.1.1: compact row radar + camera + EMF (200px thay vì 300)
               SizedBox(
-                height: 300,
+                height: 200,
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Expanded(child: _radarPanel()),
-                    const SizedBox(width: 8),
+                    const SizedBox(width: 6),
                     Expanded(child: _cameraPanel()),
+                    const SizedBox(width: 4),
+                    // EMF inline vertical bar
+                    EmfMeter(
+                      key: _emfKey,
+                      height: 200,
+                      width: 48,
+                    ),
                   ],
                 ),
               ),
-              const SizedBox(height: 8),
-              _detectionPanel(),
-              const SizedBox(height: 8),
-              _infoPanel(),
-              const SizedBox(height: 8),
+              const SizedBox(height: 4),
+              // v2.1.1: gộp detection chips + status inline (1 dòng)
+              _compactStatusRow(),
+              const SizedBox(height: 4),
+              // v2.1.1: band chart compact (title inline + waterfall 60 + 1-row bands)
               _bandChart(),
-              const SizedBox(height: 8),
+              const SizedBox(height: 4),
               _sensitivityRow(),
-              const SizedBox(height: 6),
-              _navigationPanel(),
-              const SizedBox(height: 6),
-              _note(),
-              const SizedBox(height: 6),
+              const SizedBox(height: 4),
               _buttons(),
-              const SizedBox(height: 6),
+              const SizedBox(height: 4),
               _logButtons(),
-              const SizedBox(height: 6),
+              const SizedBox(height: 4),
               _datasetButtons(),
+              const SizedBox(height: 2),
+              _compactFooter(),
             ],
           ),
         ),
@@ -1843,22 +1858,24 @@ class _RadarScreenState extends State<RadarScreen>
           fit: StackFit.expand,
           children: [
             _cameraContent(),
-            // Bounding boxes cho ML Kit detections
+            // Bounding boxes cho YOLOv8 detections
             _detectionOverlay(),
-            // Scanlines retro
-            IgnorePointer(
-              child: Column(
-                children: List<Widget>.generate(60, (i) {
-                  return Expanded(
-                    child: Container(
-                      color: i.isEven
-                          ? Colors.transparent
-                          : Colors.black.withOpacity(0.30),
-                    ),
-                  );
-                }),
+            // v2.1.1: lighter scanlines (0.12 thay vì 0.30) cho rõ camera
+            // Có thể tắt bằng nút SCAN để xem full clarity
+            if (_scanlinesOn)
+              IgnorePointer(
+                child: Column(
+                  children: List<Widget>.generate(80, (i) {
+                    return Expanded(
+                      child: Container(
+                        color: i.isEven
+                            ? Colors.transparent
+                            : Colors.black.withOpacity(0.12),
+                      ),
+                    );
+                  }),
+                ),
               ),
-            ),
             // Label
             Positioned(
               top: 4,
@@ -2078,103 +2095,265 @@ class _RadarScreenState extends State<RadarScreen>
     );
   }
 
-  Widget _infoPanel() {
+  /// v2.1.1: Compact 1-row status line replacing the old _infoPanel + _detectionPanel
+  /// (saves ~80px vertical space)
+  Widget _compactStatusRow() {
+    final Color statusColor = _ghostCombo
+        ? const Color(0xFFFF0080)
+        : _isAlarming
+            ? const Color(0xFFFF3B3B)
+            : const Color(0xFF1FE033);
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       decoration: BoxDecoration(
         color: const Color(0xFF101010),
-        border: Border.all(
-          color: _ghostCombo
-              ? const Color(0xFFFF0080)
-              : _isAlarming
-                  ? const Color(0xFFFF3B3B)
-                  : const Color(0xFF1FE033).withOpacity(0.5),
-        ),
-        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: statusColor.withOpacity(0.6)),
+        borderRadius: BorderRadius.circular(6),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Text(
-            _statusText,
-            style: TextStyle(
-              fontSize: 15,
-              color: _ghostCombo
-                  ? const Color(0xFFFF0080)
-                  : _isAlarming
-                      ? const Color(0xFFFF3B3B)
-                      : const Color(0xFF1FE033),
-              fontWeight: FontWeight.bold,
-            ),
+          Row(
+            children: [
+              Icon(
+                _isAlarming
+                    ? Icons.warning_amber_rounded
+                    : (_isScanning ? Icons.radar : Icons.power_settings_new),
+                color: statusColor,
+                size: 14,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  _statusText,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: statusColor,
+                    fontWeight: FontWeight.bold,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Text(
+                '${_dominantBandName} · ${_dominantBandHz.toStringAsFixed(1)}Hz',
+                style: const TextStyle(fontSize: 10, color: Color(0xFFB0B0B0)),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                _angleToCompass(_heading),
+                style: const TextStyle(
+                    fontSize: 10, color: Color(0xFF00E5FF)),
+              ),
+            ],
           ),
-          const SizedBox(height: 4),
-          Text(
-            'Dải mạnh nhất: $_dominantBandName · ≈ ${_dominantBandHz.toStringAsFixed(2)} Hz',
-            style: const TextStyle(fontSize: 12),
-          ),
-          Text(
-            '🧭 Bạn đang quay mặt về: ${_angleToCompass(_heading)}'
-            '${!_hasCompass ? " (không có la bàn)" : ""}',
-            style: const TextStyle(fontSize: 12),
-          ),
-          if (_isScanning)
-            Text(
-              'Báo động: $_alarmCount lần · Ghost combo: $_comboCount · '
-              'EVP clips: $_evpCount · Dataset: $_datasetCount samples',
-              style: const TextStyle(fontSize: 11, color: Color(0xFFB0B0B0)),
+          if (_objectCounts.isNotEmpty || _isScanning)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Wrap(
+                spacing: 4,
+                runSpacing: 2,
+                children: [
+                  ..._objectCounts.entries.map((e) => Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 5, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1FE033).withOpacity(0.15),
+                          border: Border.all(
+                              color: const Color(0xFF1FE033)
+                                  .withOpacity(0.5)),
+                          borderRadius: BorderRadius.circular(3),
+                        ),
+                        child: Text(
+                          '${e.key} ×${e.value}',
+                          style: const TextStyle(
+                              fontSize: 9, color: Color(0xFFB0B0B0)),
+                        ),
+                      )),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFF3B3B).withOpacity(0.15),
+                      border: Border.all(
+                          color: const Color(0xFFFF3B3B).withOpacity(0.5)),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: Text(
+                      'ALRM $_alarmCount',
+                      style: const TextStyle(
+                          fontSize: 9, color: Color(0xFFFFB0B0)),
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFF0080).withOpacity(0.15),
+                      border: Border.all(
+                          color: const Color(0xFFFF0080).withOpacity(0.5)),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: Text(
+                      'CMB $_comboCount',
+                      style: const TextStyle(
+                          fontSize: 9, color: Color(0xFFFF80C0)),
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF00E5FF).withOpacity(0.15),
+                      border: Border.all(
+                          color: const Color(0xFF00E5FF).withOpacity(0.5)),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: Text(
+                      'EVP $_evpCount · DS $_datasetCount',
+                      style: const TextStyle(
+                          fontSize: 9, color: Color(0xFFB0E5FF)),
+                    ),
+                  ),
+                ],
+              ),
             ),
         ],
       ),
     );
   }
 
+  /// v2.1.1: Compact footer with note + camera toggles (1 line)
+  Widget _compactFooter() {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            _hasCompass
+                ? '🧭 ${_angleToCompass(_heading)} · Đưa camera về phía có người/vật thể'
+                : 'Đưa camera về phía có người/vật thể để YOLO phát hiện',
+            style: const TextStyle(fontSize: 9, color: Color(0xFF707070)),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        IconButton(
+          tooltip: _scanlinesOn ? 'Tắt scanlines' : 'Bật scanlines',
+          onPressed: () => setState(() => _scanlinesOn = !_scanlinesOn),
+          icon: Icon(
+            _scanlinesOn ? Icons.grid_on : Icons.grid_off,
+            color: _scanlinesOn
+                ? const Color(0xFF1FE033)
+                : const Color(0xFF606060),
+            size: 16,
+          ),
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+        ),
+      ],
+    );
+  }
+
   Widget _bandChart() {
-    // v2.1.0: combine waterfall spectrogram + 5-band bars + EMF meter
+    // v2.1.1: compact version - title + waterfall 60 + 5 bands as 1 horizontal ribbon
     double maxE = 0;
     for (final e in _bandEnergy) {
       if (e > maxE) maxE = e;
     }
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(8),
+      padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
       decoration: BoxDecoration(
         color: const Color(0xFF0E0E0E),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(6),
         border: Border.all(color: const Color(0xFF252525)),
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Title row + EMF meter
-          Row(
-            children: [
-              const Expanded(
-                child: Text('WATERFALL + 5 DẢI TẦN (0–20 Hz)',
-                    style: TextStyle(
-                        fontSize: 12,
-                        color: Color(0xFFB0B0B0),
-                        fontWeight: FontWeight.bold)),
-              ),
-              EmfMeter(
-                key: _emfKey,
-                height: 80,
-                width: 55,
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          // Waterfall spectrogram (v2.1.0)
+          // Waterfall (compact 70px)
           WaterfallSpectrogram(
             key: _waterfallKey,
-            numBins: _fftSize ~/ 2, // 128 bins (Nyquist)
-            maxFrames: 30, // ~77s history
-            height: 120,
+            numBins: _fftSize ~/ 2,
+            maxFrames: 30,
+            height: 70,
           ),
-          const SizedBox(height: 8),
-          // 5 band bars
-          for (int i = 0; i < 5; i++) _bandBar(i, maxE),
+          const SizedBox(height: 4),
+          // 5 band bars as 1 horizontal ribbon (compact)
+          _bandRibbon(maxE),
         ],
+      ),
+    );
+  }
+
+  /// v2.1.1: 5 band bars in 1 horizontal row (each shows energy + ratio)
+  Widget _bandRibbon(double maxE) {
+    return SizedBox(
+      height: 22,
+      child: Row(
+        children: [
+          for (int i = 0; i < 5; i++) _bandBarCompact(i, maxE),
+        ],
+      ),
+    );
+  }
+
+  /// Compact version of _bandBar - small horizontal bar with name + ratio
+  Widget _bandBarCompact(int i, double maxE) {
+    final double e = _bandEnergy[i];
+    final double b = _bandBaseline[i];
+    final double ratio = b > 0 ? e / b : 0;
+    final double widthFrac = maxE > 0 ? (e / maxE).clamp(0.0, 1.0) : 0.0;
+    final Color barColor = ratio >= _sensitivity
+        ? const Color(0xFFFF3B3B)
+        : ratio >= _sensitivity * 0.6
+            ? const Color(0xFFFFB300)
+            : const Color(0xFF1FE033);
+    return Expanded(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Text(
+                  _bandNames[i],
+                  style: const TextStyle(fontSize: 8, color: Color(0xFFB0B0B0)),
+                ),
+                const Spacer(),
+                Text(
+                  '${ratio.toStringAsFixed(1)}×',
+                  style: const TextStyle(fontSize: 8, color: Color(0xFF808080)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            Expanded(
+              child: Stack(
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A1A1A),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  FractionallySizedBox(
+                    widthFactor: widthFrac,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: barColor,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

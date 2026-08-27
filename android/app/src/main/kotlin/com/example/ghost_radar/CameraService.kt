@@ -68,10 +68,23 @@ class CameraService(
                 val provider = providerFuture.get()
                 cameraProvider = provider
 
+                // v2.1.1: Bump camera resolution to 1280x720 (720p HD) for clarity.
+                // Use ResolutionSelector with HIGH quality strategy so the device
+                // picks the closest supported resolution (most Android phones support
+                // 720p on back camera; falls back gracefully if not).
+                val resSelector = androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        androidx.camera.core.resolutionselector.ResolutionStrategy(
+                            Size(1280, 720),
+                            androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    )
+                    .build()
+
                 // Bind CameraX preview output to the Flutter SurfaceTexture
                 val surfaceTexture = textureEntry.surfaceTexture()
                 val preview = Preview.Builder()
-                    .setTargetResolution(Size(640, 480))
+                    .setResolutionSelector(resSelector)
                     .build()
                 preview.setSurfaceProvider { request ->
                     val surface = android.view.Surface(surfaceTexture)
@@ -81,7 +94,7 @@ class CameraService(
                 }
 
                 val analysis = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(640, 480))
+                    .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                 analysis.setAnalyzer(analysisExecutor, YuvAnalyzer { frame ->
